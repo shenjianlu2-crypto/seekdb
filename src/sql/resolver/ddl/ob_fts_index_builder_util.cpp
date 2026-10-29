@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX STORAGE_FTS
 #include "ob_fts_index_builder_util.h"
 #include "ob_index_builder_util.h"
+#include "rust/config.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
@@ -1046,9 +1047,21 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
-      case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+      case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL: {
+        // The auxiliary tables of one fulltext index are built one after the
+        // other, so several workers can share the whole cpu budget instead of
+        // building the tables with a single worker, which left most of the
+        // machine idle for the whole build.  The number of workers is capped,
+        // because the build of one auxiliary table does not scale beyond a
+        // few workers and too many of them only add merge overhead.
+        int64_t parallelism = original_parallelism;
+        if (parallelism <= 1) {
+          const int64_t cpu_count = config::cpu_count() > 0 ? config::cpu_count() : common::get_cpu_num();
+          parallelism = MIN(cpu_count, static_cast<int64_t>(MAX_FTS_BUILD_PARALLELISM));
+        }
+        decided_parallelism = MAX(parallelism, 1L);
         break;
+      }
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
         decided_parallelism = MAX(original_parallelism / 2, 1L);

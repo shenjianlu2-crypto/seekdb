@@ -69,7 +69,8 @@ private:
   int process_one_char(TokenizeContext &ctx,
                        const char *ch,
                        const uint8_t char_len,
-                       const ObFTCharUtil::CharType type);
+                       const ObFTCharUtil::CharType type,
+                       const ob_wc_t unicode);
 
 private:
   int init_dict(const ObFTParserParam &param);

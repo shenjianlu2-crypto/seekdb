@@ -39,13 +39,15 @@ public:
   int do_process(TokenizeContext &ctx,
                  const char *ch,
                  const uint8_t char_len,
-                 const ObFTCharUtil::CharType type);
+                 const ObFTCharUtil::CharType type,
+                 const ob_wc_t unicode);
 
 private:
   int process_CN_number(TokenizeContext &ctx,
                         const char *ch,
                         const uint8_t char_len,
-                        const ObFTCharUtil::CharType type);
+                        const ObFTCharUtil::CharType type,
+                        const ob_wc_t unicode);
 
   int process_CN_count(TokenizeContext &ctx,
                        const char *ch,

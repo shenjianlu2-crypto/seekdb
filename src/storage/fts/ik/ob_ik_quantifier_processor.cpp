@@ -32,11 +32,12 @@ namespace storage
 int ObIKQuantifierProcessor::do_process(TokenizeContext &ctx,
                                         const char *ch,
                                         const uint8_t char_len,
-                                        const ObFTCharUtil::CharType type)
+                                        const ObFTCharUtil::CharType type,
+                                        const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
   // it do have an order, process number first
-  if (OB_FAIL(process_CN_number(ctx, ch, char_len, type))) {
+  if (OB_FAIL(process_CN_number(ctx, ch, char_len, type, unicode))) {
   } else if (OB_FAIL(process_CN_count(ctx, ch, char_len, type))) {
   }
   return ret;
@@ -45,13 +46,14 @@ int ObIKQuantifierProcessor::do_process(TokenizeContext &ctx,
 int ObIKQuantifierProcessor::process_CN_number(TokenizeContext &ctx,
                                                const char *ch,
                                                const uint8_t char_len,
-                                               const ObFTCharUtil::CharType type)
+                                               const ObFTCharUtil::CharType type,
+                                               const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
   bool is_cn_number = false;
 
   if (ObFTCharUtil::CharType::CHINESE == type
-      && OB_FAIL(ObFTCharUtil::check_cn_number(ctx.collation(), ch, char_len, is_cn_number))) {
+      && OB_FAIL(ObFTCharUtil::check_cn_number(ctx.collation(), unicode, is_cn_number))) {
   } else if (start_ == -1 && end_ == -1) {
     if (is_cn_number) {
       start_ = ctx.get_cursor();

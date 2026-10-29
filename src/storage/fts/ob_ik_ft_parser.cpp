@@ -131,14 +131,15 @@ int ObIKFTParser::produce()
 int ObIKFTParser::process_one_char(TokenizeContext &ctx,
                                    const char *ch,
                                    const uint8_t char_len,
-                                   const ObFTCharUtil::CharType type)
+                                   const ObFTCharUtil::CharType type,
+                                   const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
   // proces by char with all segmenters
   for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
        OB_SUCC(ret) && iter != segmenters_.end();
        iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
+    if (OB_FAIL((*iter)->process(ctx, ch, char_len, type, unicode))) {
     }
   }
   return ret;
@@ -161,7 +162,7 @@ int ObIKFTParser::process_next_batch()
       ObFTCharUtil::CharType type = ObFTCharUtil::CharType::USELESS;
       if (OB_FAIL(ctx_->current_char(ch, char_len))) {
       } else if (OB_FAIL(ctx_->current_char_type(type))) {
-      } else if (OB_FAIL(process_one_char(*ctx_, ch, char_len, type))) {
+      } else if (OB_FAIL(process_one_char(*ctx_, ch, char_len, type, ctx_->current_char_unicode()))) {
       } else {
         // 1. check segmention
         if (ctx_->handle_size() > SEGMENT_LIMIT && type == ObFTCharUtil::CharType::USELESS) {

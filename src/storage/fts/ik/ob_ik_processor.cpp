@@ -31,17 +31,15 @@ namespace oceanbase
 {
 namespace storage
 {
-int ObIIKProcessor::process(TokenizeContext &ctx)
+int ObIIKProcessor::process(TokenizeContext &ctx,
+                            const char *ch,
+                            const uint8_t char_len,
+                            const ObFTCharUtil::CharType type,
+                            const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
 
-  ObFTCharUtil::CharType type;
-  const char *ch = nullptr;
-  uint8_t char_len = 0;
-
-  if (OB_FAIL(ctx.current_char_type(type))) {
-  } else if (OB_FAIL(ctx.current_char(ch, char_len))) {
-  } else if (OB_FAIL(do_process(ctx, ch, char_len, type))) {
+  if (OB_FAIL(do_process(ctx, ch, char_len, type, unicode))) {
   }
   return ret;
 }
@@ -52,7 +50,8 @@ TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  int64_t fulltext_len,
                                  bool is_smart)
     : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
-      next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
+      next_char_len_(0), next_char_type_(ObFTCharUtil::CharType::USELESS), next_char_unicode_(0),
+      handle_size_(0), is_smart_(is_smart), token_list_(allocator),
       result_list_(allocator)
 {
 }
@@ -109,7 +108,8 @@ int TokenizeContext::prepare_next_char()
   } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
                                                        fulltext_ + cursor_,
                                                        next_char_len_,
-                                                       next_char_type_))) {
+                                                       next_char_type_,
+                                                       next_char_unicode_))) {
   }
   return ret;
 }

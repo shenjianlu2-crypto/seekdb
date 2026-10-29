@@ -41,6 +41,8 @@ public:
   static const int64_t OB_FTS_INDEX_TABLE_INDEX_COL_CNT = 2;
   static const int64_t OB_FTS_DOC_WORD_TABLE_INDEX_COL_CNT = 2;
   static const int64_t OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT = 4;
+  // Number of workers used to build one auxiliary table of a fulltext index.
+  static const int64_t MAX_FTS_BUILD_PARALLELISM = 4;
 public:
   // Check if we can use rowkey instead of doc id.
   // if we want to add more types, make this one condition of them.
