@@ -17,7 +17,6 @@
 #define USING_LOG_PREFIX STORAGE_FTS
 #include "ob_fts_index_builder_util.h"
 #include "ob_index_builder_util.h"
-#include "rust/config.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
@@ -26,6 +25,7 @@
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
+#include "lib/utility/utility.h"
 
 namespace oceanbase
 {
@@ -1056,8 +1056,7 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         // few workers and too many of them only add merge overhead.
         int64_t parallelism = original_parallelism;
         if (parallelism <= 1) {
-          const int64_t cpu_count = config::cpu_count() > 0 ? config::cpu_count() : common::get_cpu_num();
-          parallelism = MIN(cpu_count, static_cast<int64_t>(MAX_FTS_BUILD_PARALLELISM));
+          parallelism = MIN(common::get_cpu_num(), static_cast<int64_t>(MAX_FTS_BUILD_PARALLELISM));
         }
         decided_parallelism = MAX(parallelism, 1L);
         break;
