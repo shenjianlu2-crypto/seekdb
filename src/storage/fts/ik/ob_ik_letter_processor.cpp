@@ -34,12 +34,13 @@ ObIKLetterProcessor::ObIKLetterProcessor() {}
 int ObIKLetterProcessor::do_process(TokenizeContext &ctx,
                                     const char *ch,
                                     const uint8_t char_len,
-                                    const ObFTCharUtil::CharType type)
+                                    const ObFTCharUtil::CharType type,
+                                    const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(process_english_letter(ctx, ch, char_len, type))) {
-  } else if (OB_FAIL(process_arabic_letter(ctx, ch, char_len, type))) {
-  } else if (OB_FAIL(process_mix_letter(ctx, ch, char_len, type))) {
+  } else if (OB_FAIL(process_arabic_letter(ctx, ch, char_len, type, unicode))) {
+  } else if (OB_FAIL(process_mix_letter(ctx, ch, char_len, type, unicode))) {
   }
   return ret;
 }
@@ -92,7 +93,8 @@ int ObIKLetterProcessor::process_english_letter(TokenizeContext &ctx,
 int ObIKLetterProcessor::process_arabic_letter(TokenizeContext &ctx,
                                                const char *ch,
                                                const uint8_t char_len,
-                                               const ObFTCharUtil::CharType type)
+                                               const ObFTCharUtil::CharType type,
+                                               const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
 
@@ -111,7 +113,7 @@ int ObIKLetterProcessor::process_arabic_letter(TokenizeContext &ctx,
     arabic_char_cnt_++;
     arabic_connect_cnt_ = 0;
   } else if (OB_FAIL(
-                 ObFTCharUtil::check_num_connector(ctx.collation(), ch, char_len, is_connector))) {
+                 ObFTCharUtil::check_num_connector(ctx.collation(), unicode, is_connector))) {
   } else if (ObFTCharUtil::CharType::USELESS == type && is_connector) {
     // only if connector follows  and is followed by an arabic number we count it
     arabic_connect_cnt_++;
@@ -151,7 +153,8 @@ int ObIKLetterProcessor::process_arabic_letter(TokenizeContext &ctx,
 int ObIKLetterProcessor::process_mix_letter(TokenizeContext &ctx,
                                             const char *ch,
                                             const uint8_t char_len,
-                                            const ObFTCharUtil::CharType type)
+                                            const ObFTCharUtil::CharType type,
+                                            const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
 
@@ -169,8 +172,7 @@ int ObIKLetterProcessor::process_mix_letter(TokenizeContext &ctx,
       mix_end_ = ctx.get_end_cursor();
       this->mix_char_cnt_++;
     } else if (OB_FAIL(ObFTCharUtil::check_letter_connector(ctx.collation(),
-                                                            ch,
-                                                            char_len,
+                                                            unicode,
                                                             is_connector))) {
     } else if (ObFTCharUtil::CharType::USELESS == type && is_connector) {
       this->mix_end_ = ctx.get_end_cursor();

@@ -47,6 +47,8 @@ public:
 
   int current_char(const char *&ch, uint8_t &char_len);
   int current_char_type(ObFTCharUtil::CharType &type);
+  // Code point of the current character, decoded while classifying it.
+  ob_wc_t current_char_unicode() const { return next_char_unicode_; }
 
   int step_next();
 
@@ -83,6 +85,7 @@ private:
   int64_t cursor_;
   int64_t next_char_len_;
   ObFTCharUtil::CharType next_char_type_;
+  ob_wc_t next_char_unicode_;
 
   uint32_t handle_size_;
   bool is_smart_;
@@ -101,12 +104,19 @@ public:
 
   virtual ~ObIIKProcessor() {}
 
-  int process(TokenizeContext &ctx);
+  // The current character is passed in so that the processors do not have to
+  // fetch it from the context again for every processor of every character.
+  int process(TokenizeContext &ctx,
+             const char *ch,
+             const uint8_t char_len,
+             const ObFTCharUtil::CharType type,
+             const ob_wc_t unicode);
 
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,
                          const uint8_t char_len,
-                         const ObFTCharUtil::CharType type)
+                         const ObFTCharUtil::CharType type,
+                         const ob_wc_t unicode)
       = 0;
 };
 

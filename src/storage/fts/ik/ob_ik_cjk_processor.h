@@ -39,7 +39,8 @@ public:
   int do_process(TokenizeContext &ctx,
                  const char *ch,
                  const uint8_t char_len,
-                 const ObFTCharUtil::CharType type) override;
+                 const ObFTCharUtil::CharType type,
+                 const ob_wc_t unicode) override;
 
 private:
   ObList<ObDATrieHit, ObIAllocator> hits_;

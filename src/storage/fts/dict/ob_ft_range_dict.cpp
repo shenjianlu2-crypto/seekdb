@@ -382,16 +382,17 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
+  // The last matched range is checked first, because consecutive characters of
+  // a document normally belong to the same range.
+  if (last_range_idx_ >= 0 && last_range_idx_ < range_dicts_.size()
+      && is_in_range(range_dicts_[last_range_idx_], single_word)) {
+    dict = range_dicts_[last_range_idx_].dict_;
+    found = true;
+  }
   for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+    if (is_in_range(range_dicts_[i], single_word)) {
       dict = range_dicts_[i].dict_;
+      last_range_idx_ = i;
       found = true;
     }
   }

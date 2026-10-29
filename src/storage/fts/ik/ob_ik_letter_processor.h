@@ -32,7 +32,8 @@ public:
   int do_process(TokenizeContext &ctx,
                  const char *ch,
                  const uint8_t char_len,
-                 const ObFTCharUtil::CharType type) override;
+                 const ObFTCharUtil::CharType type,
+                 const ob_wc_t unicode) override;
 
 private:
   int process_english_letter(TokenizeContext &ctx,
@@ -43,12 +44,14 @@ private:
   int process_arabic_letter(TokenizeContext &ctx,
                             const char *ch,
                             const uint8_t char_len,
-                            const ObFTCharUtil::CharType type);
+                            const ObFTCharUtil::CharType type,
+                            const ob_wc_t unicode);
 
   int process_mix_letter(TokenizeContext &ctx,
                          const char *ch,
                          const uint8_t char_len,
-                         const ObFTCharUtil::CharType type);
+                         const ObFTCharUtil::CharType type,
+                         const ob_wc_t unicode);
 
   void reset_english_state();
 

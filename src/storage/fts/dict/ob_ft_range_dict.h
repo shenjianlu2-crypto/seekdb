@@ -20,6 +20,7 @@
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/ob_allocator.h"
 #include "lib/allocator/page_arena.h"
+#include "lib/charset/ob_charset.h"
 #include "lib/container/ob_vector.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "share/rc/ob_server_runtime.h"
@@ -99,6 +100,18 @@ private:
 
   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
 
+  bool is_in_range(const ObFTRange &range, const ObString &single_word) const
+  {
+    return ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                             range.start_.get_word(),
+                             single_word)
+               <= 0
+           && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                range.end_.get_word(),
+                                single_word)
+                  >= 0;
+  }
+
 private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
   bool is_inited_;
@@ -106,6 +119,9 @@ private:
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
   ObFTCacheRangeContainer *range_container_; // only used to read cache
+  // Consecutive characters of one document almost always belong to the same
+  // dictionary range, so the last matched range is checked first.
+  mutable int64_t last_range_idx_ = -1;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFTRangeDict);
