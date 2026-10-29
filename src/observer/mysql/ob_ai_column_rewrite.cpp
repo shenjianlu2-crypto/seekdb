@@ -22,6 +22,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -611,6 +612,8 @@ private:
 // AI column registry
 // ---------------------------------------------------------------------------
 
+const int64_t LOAD_RETRY_INTERVAL_US = 1000 * 1000L;
+
 class AiColumnRegistry
 {
 public:
@@ -625,8 +628,16 @@ public:
     int ret = OB_SUCCESS;
     std::lock_guard<std::mutex> guard(lock_);
     if (!loaded_) {
+      const int64_t now = ObTimeUtility::current_time();
+      if (retry_ts_ > now) {
+        // A previous attempt failed; do not run the bootstrap DDL again for
+        // every statement.  The registry simply stays empty until the retry.
+        return OB_SUCCESS;
+      }
       if (OB_FAIL(bootstrap())) {
+        retry_ts_ = now + LOAD_RETRY_INTERVAL_US;
       } else if (OB_FAIL(load_all())) {
+        retry_ts_ = now + LOAD_RETRY_INTERVAL_US;
       } else {
         loaded_ = true;
       }
@@ -728,6 +739,7 @@ private:
 
   std::mutex lock_;
   bool loaded_ = false;
+  int64_t retry_ts_ = 0;
   std::map<std::string, std::shared_ptr<AiTableMeta>> tables_;
   std::set<std::string> dirty_;
 };
@@ -1733,11 +1745,16 @@ int build_task_insert(const AiTableMeta &meta,
   int ret = OB_SUCCESS;
   sql_text = "insert into oceanbase.__all_ai_column_task(table_id, column_id, database_name, "
              "table_name, column_name, rowkey_predicate, request_id, state, retry_count, "
-             "max_retries, result_type, expression, system_prompt, model_name, kind, dim) select ";
+             "max_retries, eligible_ts, result_type, expression, system_prompt, model_name, kind, dim) "
+             "select ";
   sql_text += std::to_string(meta.table_id_) + ", " + std::to_string(col.column_id_) + ", ";
   sql_text += sql_str(meta.db_) + ", " + sql_str(meta.table_) + ", " + sql_str(col.column_) + ", ";
   sql_text += predicate_expr + ", " + sql_str(rid) + ", 0, 0, " +
               std::to_string(col.max_retries_) + ", ";
+  // The auxiliary statement runs after the user statement, so its clock is a
+  // few milliseconds ahead of the now() the session saw.  The task is eligible
+  // from the moment it is created, so keep the timestamp slightly in the past.
+  sql_text += "date_sub(now(6), interval 1 second), ";
   sql_text += sql_str(col.result_type_) + ", " + sql_str(col.expr_) + ", " +
               sql_str(col.system_prompt_) + ", ";
   sql_text += sql_str(col.model_) + ", " + sql_str(col.kind_) + ", " +
@@ -2615,6 +2632,18 @@ struct AiTaskGroup
 };
 
 std::atomic<bool> g_ai_column_worker_started(false);
+std::atomic<bool> g_ai_column_worker_stop(false);
+// Deliberately leaked: the worker is joined from an exit handler, which may
+// run after this translation unit's statics have already been destroyed.
+std::thread *g_ai_column_worker = nullptr;
+
+void stop_ai_column_worker()
+{
+  g_ai_column_worker_stop.store(true);
+  if (nullptr != g_ai_column_worker && g_ai_column_worker->joinable()) {
+    g_ai_column_worker->join();
+  }
+}
 
 int fetch_ai_column_tasks(InnerSql &sql, std::vector<AiTaskRow> &rows)
 {
@@ -2777,12 +2806,16 @@ int process_ai_task_group(InnerSql &sql, const AiTaskGroup &group)
 void ai_column_worker_loop()
 {
   int ret = OB_SUCCESS;
+  int64_t idle_ms = 50;
   std::unique_ptr<InnerSql> sql(new (std::nothrow) InnerSql());
   // A detached thread has no tenant entity or thread local context of its own;
   // both are required before the inner SQL proxy can serve reads and writes.
   CREATE_WITH_TEMP_ENTITY(RESOURCE_OWNER, common::OB_SERVER_RUNTIME_ID) {
-    while (OB_NOT_NULL(sql.get())) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    while (!g_ai_column_worker_stop.load() && OB_NOT_NULL(sql.get())) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(idle_ms));
+      if (g_ai_column_worker_stop.load()) {
+        break;
+      }
       ret = OB_SUCCESS;
       if (OB_SUCCESS != share::check_server_runtime_ready()) {
         continue;
@@ -2793,7 +2826,15 @@ void ai_column_worker_loop()
           .set_page_size(OB_MALLOC_REQ_NORMAL_BLOCK_SIZE);
       CREATE_WITH_TEMP_CONTEXT(param) {
         std::vector<AiTaskRow> rows;
-        if (OB_SUCCESS == fetch_ai_column_tasks(*sql, rows) && !rows.empty()) {
+        const bool fetched = (OB_SUCCESS == fetch_ai_column_tasks(*sql, rows));
+        if (fetched) {
+          idle_ms = 50;
+        } else {
+          // The task table may not exist yet (feature bootstrapping failed);
+          // back off so a broken catalog cannot turn into a log storm.
+          idle_ms = std::min(idle_ms * 2, static_cast<int64_t>(2000));
+        }
+        if (fetched && !rows.empty()) {
           std::vector<AiTaskGroup> groups;
           std::map<std::string, size_t> index;
           for (size_t i = 0; i < rows.size(); ++i) {
@@ -2849,6 +2890,15 @@ void ai_column_worker_loop()
 
 } // namespace
 
+namespace
+{
+bool ai_column_rewrite_error_is_user_facing(int err)
+{
+  return OB_ERR_PARSE_SQL == err || OB_NOT_SUPPORTED == err ||
+         OB_ERR_INVALID_VECTOR_DIM == err || OB_AI_COLUMN_UNFINISHED_TASK == err;
+}
+} // namespace
+
 int rewrite_ai_column_statements(sql::ObSQLSessionInfo &session,
                                  common::ObIAllocator &alloc,
                                  common::ObIArray<common::ObString> &queries)
@@ -2860,9 +2910,7 @@ int rewrite_ai_column_statements(sql::ObSQLSessionInfo &session,
   const size_t count = static_cast<size_t>(queries.count());
   ctx.posts_.resize(count);
   ctx.actions_.resize(count);
-  if (OB_FAIL(start_ai_column_worker())) {
-    LOG_WARN("failed to start AI column worker", K(ret));
-  }
+  (void)AiColumnRegistry::instance().ensure_loaded();
   for (int64_t i = 0; OB_SUCC(ret) && i < queries.count(); ++i) {
     const common::ObString &stmt = queries.at(i);
     if (stmt.empty() || OB_ISNULL(stmt.ptr())) {
@@ -2871,16 +2919,33 @@ int rewrite_ai_column_statements(sql::ObSQLSessionInfo &session,
     const std::string original(stmt.ptr(), static_cast<size_t>(stmt.length()));
     std::string rewritten;
     bool changed = false;
-    if (OB_FAIL(rewrite_one_statement(session, i, original, rewritten, changed))) {
-      LOG_WARN("failed to rewrite AI column statement", K(ret), K(original.c_str()));
+    const int rewrite_ret = rewrite_one_statement(session, i, original, rewritten, changed);
+    if (OB_SUCCESS != rewrite_ret) {
+      // Definition validation and strict read are part of the feature and must
+      // reach the client.  Anything else (metadata bootstrap, catalog access,
+      // ...) must degrade to "the statement is executed as written".
+      if (ai_column_rewrite_error_is_user_facing(rewrite_ret)) {
+        ret = rewrite_ret;
+        LOG_WARN("AI column statement rejected", K(rewrite_ret));
+      } else {
+        LOG_WARN("ignore AI column rewrite failure", K(rewrite_ret), K(original.c_str()));
+        ctx.posts_[static_cast<size_t>(i)].clear();
+        ctx.actions_[static_cast<size_t>(i)].clear();
+      }
     } else if (changed) {
       common::ObString new_sql;
       if (OB_FAIL(ai_copy_to_allocator(alloc, rewritten, new_sql))) {
+        LOG_WARN("ignore AI column rewrite: allocation failed", K(ret));
+        ret = OB_SUCCESS;
       } else {
         queries.at(i).assign(new_sql.ptr(), new_sql.length());
         LOG_TRACE("AI column statement rewritten", K(original.c_str()), K(rewritten.c_str()));
       }
     }
+  }
+  // The materialization thread is only needed once an AI column table is known.
+  if (AiColumnRegistry::instance().has_any()) {
+    (void)start_ai_column_worker();
   }
   return ret;
 }
@@ -2939,8 +3004,17 @@ int start_ai_column_worker()
   int ret = OB_SUCCESS;
   bool expected = false;
   if (g_ai_column_worker_started.compare_exchange_strong(expected, true)) {
-    std::thread worker(ai_column_worker_loop);
-    worker.detach();
+    g_ai_column_worker_stop.store(false);
+    std::thread *worker = new (std::nothrow) std::thread(ai_column_worker_loop);
+    if (OB_ISNULL(worker)) {
+      g_ai_column_worker_started.store(false);
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      g_ai_column_worker = worker;
+      // The server has no shutdown hook for this helper thread; joining it at
+      // process exit keeps it from touching already destroyed statics.
+      (void)atexit(stop_ai_column_worker);
+    }
   }
   return ret;
 }

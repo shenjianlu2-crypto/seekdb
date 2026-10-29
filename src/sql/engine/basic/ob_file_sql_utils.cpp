@@ -2226,6 +2226,34 @@ int read_file_sql_json(common::ObIAllocator &alloc,
   return ret;
 }
 
+// Shell-style '*'/'?' matching, portable across the Win32 and dirent paths.
+namespace
+{
+bool glob_match(const char *name, const char *pattern)
+{
+  const char *star = NULL;
+  const char *resume = NULL;
+  while ('\0' != *name) {
+    if ('?' == *pattern || *pattern == *name) {
+      ++name;
+      ++pattern;
+    } else if ('*' == *pattern) {
+      star = pattern++;
+      resume = name;
+    } else if (NULL != star) {
+      pattern = star + 1;
+      name = ++resume;
+    } else {
+      return false;
+    }
+  }
+  while ('*' == *pattern) {
+    ++pattern;
+  }
+  return '\0' == *pattern;
+}
+} // anonymous namespace
+
 int glob_file_sql(common::ObIAllocator &alloc,
                   const common::ObString &pattern,
                   common::ObString &json_out)
@@ -2246,13 +2274,13 @@ int glob_file_sql(common::ObIAllocator &alloc,
   std::vector<std::string> files;
 #ifdef _WIN32
   WIN32_FIND_DATAA fd;
-  std::string search = dir + "\\" + file_pat;
+  std::string search = dir + "\\*";
   HANDLE h = FindFirstFileA(search.c_str(), &fd);
   if (INVALID_HANDLE_VALUE != h) {
     do {
-      if (0 == (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-        files.push_back(dir + "/" + std::string(fd.cFileName));
-      }
+      if (0 != (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) { continue; }
+      if (!glob_match(fd.cFileName, file_pat.c_str())) { continue; }
+      files.push_back(dir + "/" + std::string(fd.cFileName));
     } while (FindNextFileA(h, &fd));
     FindClose(h);
   }
@@ -2262,6 +2290,7 @@ int glob_file_sql(common::ObIAllocator &alloc,
     struct dirent *ent = NULL;
     while (NULL != (ent = readdir(d))) {
       if (0 == strcmp(ent->d_name, ".") || 0 == strcmp(ent->d_name, "..")) { continue; }
+      if (!glob_match(ent->d_name, file_pat.c_str())) { continue; }
       std::string full = dir + "/" + ent->d_name;
       struct stat st;
       if (0 == stat(full.c_str(), &st) && S_ISREG(st.st_mode)) {

@@ -1219,6 +1219,14 @@ bool lookup_session_flag(sql::ObSQLSessionInfo &session)
   return enabled;
 }
 
+// Errors raised on purpose while analysing a file SQL call must reach the user;
+// anything else is an internal hiccup and the original text is executed as is.
+bool file_sql_error_is_user_facing(int err)
+{
+  return OB_ERR_PARSE_SQL == err || OB_NOT_SUPPORTED == err ||
+         OB_ERR_NO_PRIV_DIRECT_PATH_ACCESS == err;
+}
+
 } // namespace
 
 int rewrite_file_sql_statements(sql::ObSQLSessionInfo &session,
@@ -1228,8 +1236,12 @@ int rewrite_file_sql_statements(sql::ObSQLSessionInfo &session,
   int ret = OB_SUCCESS;
   common::ObString secure_file_priv;
   bool enabled = lookup_session_flag(session);
-  if (OB_FAIL(session.get_secure_file_priv(secure_file_priv))) {
-    LOG_WARN("failed to get secure_file_priv", K(ret));
+  const int priv_ret = session.get_secure_file_priv(secure_file_priv);
+  if (OB_SUCCESS != priv_ret) {
+    // Fail closed: without a trustworthy secure_file_priv nothing is rewritten
+    // (read_csv() stays an unknown function) and the user statement is intact.
+    LOG_WARN("skip file SQL rewrite: secure_file_priv is unavailable", K(priv_ret));
+    return ret;
   } else if (secure_file_priv.empty()) {
     secure_file_priv.assign_ptr("/", 1);
   }
@@ -1239,12 +1251,21 @@ int rewrite_file_sql_statements(sql::ObSQLSessionInfo &session,
     } else {
       std::string rewritten;
       bool changed = false;
-      if (OB_FAIL(rewrite_one_statement(alloc, secure_file_priv, enabled,
-                                       sql.ptr(), sql.length(), rewritten, changed))) {
-        LOG_WARN("failed to rewrite file SQL statement", K(ret));
+      const int rewrite_ret = rewrite_one_statement(alloc, secure_file_priv, enabled,
+                                                    sql.ptr(), sql.length(), rewritten, changed);
+      if (OB_SUCCESS != rewrite_ret) {
+        if (file_sql_error_is_user_facing(rewrite_ret)) {
+          ret = rewrite_ret;
+        } else {
+          // An internal failure must not turn a valid statement into an error;
+          // the original text is executed and reports its own diagnostics.
+          LOG_WARN("ignore file SQL rewrite failure", K(rewrite_ret));
+        }
       } else if (changed) {
         common::ObString new_sql;
         if (OB_FAIL(copy_to_allocator(alloc, rewritten, new_sql))) {
+          LOG_WARN("ignore file SQL rewrite: allocation failed", K(ret));
+          ret = OB_SUCCESS;
         } else {
           queries.at(i).assign(new_sql.ptr(), new_sql.length());
           LOG_TRACE("file SQL statement rewritten", K(sql), K(new_sql));
