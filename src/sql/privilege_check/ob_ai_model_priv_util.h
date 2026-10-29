@@ -53,7 +53,7 @@ public:
     bool &has_priv);
 
 private:
-  enum ObAIServiceEndpointPrivType {
+  enum ObAIServiceEndpointPrivType : int64_t {
     AI_PRIV_CREATE = OB_PRIV_CREATE_AI_MODEL,
     AI_PRIV_ALTER  = OB_PRIV_ALTER_AI_MODEL,
     AI_PRIV_DROP   = OB_PRIV_DROP_AI_MODEL,

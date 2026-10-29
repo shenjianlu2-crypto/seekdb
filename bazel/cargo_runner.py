@@ -9,6 +9,18 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import time
+
+
+def remove_tree(path):
+    # Windows toolchain helpers recreate directories under HOME while Cargo
+    # exits, so a single rmtree can observe a non-empty directory.
+    for _ in range(20):
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return
+        time.sleep(0.25)
+    shutil.rmtree(path, ignore_errors=True)
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--work-dir", required=True)
@@ -27,7 +39,7 @@ work = Path(args.work_dir).absolute()
 # Each action owns the whole directory; no incremental state survives outside
 # the declared outputs or leaks in from a user's Cargo configuration.
 if work.exists():
-    shutil.rmtree(work)
+    remove_tree(work)
 work.mkdir(parents=True)
 workspace = work / "workspace"
 for source in json.loads(Path(args.sources).read_text()):
@@ -110,6 +122,6 @@ status = subprocess.call(command, env=environment)
 if status == 0:
     # Only exported archives/headers need caching. Cargo's private workspace,
     # extracted sources and intermediate objects are disposable action scratch.
-    shutil.rmtree(work)
-    work.mkdir()
+    remove_tree(work)
+    work.mkdir(exist_ok=True)
 raise SystemExit(status)

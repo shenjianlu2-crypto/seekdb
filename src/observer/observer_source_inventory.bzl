@@ -80,6 +80,8 @@ OBSERVER_UNITY_GROUPS = [
             "src/observer/mysql/obmp_packet_sender.cpp",
             "src/observer/mysql/obmp_ping.cpp",
             "src/observer/mysql/obmp_query.cpp",
+            "src/observer/mysql/ob_file_sql_rewrite.cpp",
+            "src/observer/mysql/ob_ai_column_rewrite.cpp",
             "src/observer/mysql/obmp_process_info.cpp",
             "src/observer/mysql/obmp_process_kill.cpp",
             "src/observer/mysql/obmp_debug.cpp",

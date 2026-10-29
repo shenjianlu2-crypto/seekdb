@@ -20,6 +20,8 @@
 #include "observer/ob_server_runtime_access.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "observer/mysql/obmp_query.h"
+#include "observer/mysql/ob_file_sql_rewrite.h"
+#include "observer/mysql/ob_ai_column_rewrite.h"
 #include "sql/engine/ob_physical_plan.h"
 
 #include "observer/mysql/ob_sync_plan_driver.h"
@@ -142,6 +144,18 @@ int ObMPQuery::process()
           ret = OB_ERR_UNEXPECTED;
           need_response_error = true;//Enter this branch, the connection must be terminated, it is a critical error
           LOG_ERROR("emtpy query count. client would have suspended. never be here!", K_(sql), K(ret));
+        } else if (OB_FAIL(observer::rewrite_file_sql_statements(session,
+                                                                THIS_WORKER.get_sql_arena_allocator(),
+                                                                queries))) {
+          // file SQL statements are rewritten into native json_table scans before execution
+          need_response_error = true;
+          need_disconnect = false;
+        } else if (OB_FAIL(observer::rewrite_ai_column_statements(
+                       session, THIS_WORKER.get_sql_arena_allocator(), queries))) {
+          // AI COLUMN statements are rewritten in place; the auxiliary statements
+          // they generate are executed right after the user statement succeeds
+          need_response_error = true;
+          need_disconnect = false;
         } else if (OB_UNLIKELY(1 == session.get_capability().cap_flags_.OB_CLIENT_MULTI_STATEMENTS)) {
           // Handle Multiple Statement
           /* MySQL behavior when handling Multi-Stmt errors:
@@ -202,7 +216,8 @@ int ObMPQuery::process()
                 // Originally, it could have been designed so that the last query can always respond asynchronously regardless of queries.count(),
                 // However, the current code implementation struggles to handle the response packets of the same request in different threads,
                 // Therefore, only one query is allowed in an asynchronous response for a multi-query request here.
-                force_sync_resp = queries.count() <= 1? false : true;
+                force_sync_resp = (queries.count() <= 1 ? false : true) ||
+                                  observer::ai_column_has_post_statements();
                 // is_part_of_multi indicates that the current SQL is one of the
                 // statements in a multi-statement request.
                 bool is_part_of_multi = queries.count() > 1 ? true : false;
@@ -213,6 +228,11 @@ int ObMPQuery::process()
                                           force_sync_resp,
                                           async_resp_used,
                                           need_disconnect);
+                if (OB_SUCC(ret)) {
+                  // auxiliary AI COLUMN statements run in the user session and
+                  // transaction, after the user statement has been answered
+                  (void)observer::run_ai_column_post_statements(session, i);
+                }
               }
             }
           }
@@ -230,6 +250,10 @@ int ObMPQuery::process()
           } else {
             EVENT_INC(SQL_SINGLE_QUERY_COUNT);
             // Handle ordinary Single Statement
+            force_sync_resp = force_sync_resp || observer::ai_column_has_post_statements();
+            if (OB_SUCC(ret) && false == queries.at(0).empty()) {
+              sql_ = queries.at(0);
+            }
             ret = process_single_stmt(ObMultiStmtItem(false, 0, sql_),
                                       conn,
                                       session,
@@ -237,6 +261,9 @@ int ObMPQuery::process()
                                       force_sync_resp,
                                       async_resp_used,
                                       need_disconnect);
+            if (OB_SUCC(ret)) {
+              (void)observer::run_ai_column_post_statements(session, 0);
+            }
           }
         }
       }

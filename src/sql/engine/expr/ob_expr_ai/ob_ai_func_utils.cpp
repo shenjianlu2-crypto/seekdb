@@ -1359,6 +1359,25 @@ int ObAIFuncUtils::get_ai_func_info(ObIAllocator &allocator, const ObString &mod
   return ret;
 }
 
+int ObAIFuncModel::extract_system_prompt(ObJsonObject *config, ObString &system_prompt)
+{
+  int ret = OB_SUCCESS;
+  system_prompt.reset();
+  if (OB_NOT_NULL(config)) {
+    ObIJsonBase *sys_base = nullptr;
+    ObString sys_key("system");
+    int tmp_ret = config->get_object_value(sys_key, sys_base);
+    if (OB_SUCCESS == tmp_ret && OB_NOT_NULL(sys_base)
+        && ObJsonNodeType::J_STRING == sys_base->json_type()) {
+      system_prompt = static_cast<ObJsonString *>(sys_base)->get_str();
+      if (OB_FAIL(config->object_remove(sys_key))) {
+        LOG_WARN("failed to strip system prompt from config", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObString &result)
 {
   int ret = OB_SUCCESS;
@@ -1375,6 +1394,7 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
+  } else if (OB_FAIL(extract_system_prompt(config, prompt_str))) {
   } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_.get_provider(), complete_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {

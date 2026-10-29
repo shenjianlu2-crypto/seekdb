@@ -367,6 +367,7 @@ public:
    bool is_dense_embedding_type() {return info_.type_ == share::EndpointType::DENSE_EMBEDDING;}
    bool is_rerank_type() {return info_.type_ == share::EndpointType::RERANK;}
    const ObString get_request_model_name();
+   int extract_system_prompt(ObJsonObject *config, ObString &system_prompt);
    ObIAllocator *allocator_;
    const ObAIFuncExprInfo &info_;
    const share::ObAiModelEndpointInfo &endpoint_info_;
