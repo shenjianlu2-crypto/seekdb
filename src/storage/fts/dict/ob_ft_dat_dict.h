@@ -99,6 +99,10 @@ public:
   size_t data_index_offset_ = 0;
   // use if offset is not 0
   size_t data_offset_ = 0;
+  // Process wide identity of this dat, assigned when the dat is built.  The
+  // reader keeps a small per thread cache of character -> code lookups, and
+  // the identity tells it whether an entry still belongs to this dat.
+  uint32_t cache_id_ = 0;
   // a buffer to store dat
   ObFTSingleWord start_word_;
   ObFTSingleWord end_word_;

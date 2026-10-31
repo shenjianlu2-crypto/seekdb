@@ -27,10 +27,59 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "share/rc/ob_server_runtime.h"
 #include "storage/fts/dict/ob_ft_trie.h"
+
+#include <atomic>
+
 namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+// The reader resolves the code of a character through the hash map of the dat.
+// The map of the main dictionary is several megabytes, so every lookup touches
+// two random cache lines, while the same characters show up over and over
+// again in a document.  A tiny direct mapped cache of character -> code keeps
+// the repeated lookups in the first level cache.
+struct ObFTWordCodeCacheEntry
+{
+  uint32_t cache_id_;
+  uint32_t word_key_;
+  // 0 when the slot is empty, -1 when the character is not in the dictionary.
+  int32_t code_;
+  uint8_t word_len_;
+};
+
+constexpr int64_t FT_WORD_CODE_CACHE_SIZE = 8192;
+thread_local ObFTWordCodeCacheEntry FT_WORD_CODE_CACHE[FT_WORD_CODE_CACHE_SIZE];
+
+uint32_t next_dat_cache_id()
+{
+  static std::atomic<uint32_t> next_id(1);
+  return next_id.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline uint32_t ft_word_cache_index(const uint32_t cache_id, const uint32_t word_key)
+{
+  uint64_t hash = (static_cast<uint64_t>(word_key) * UINT64_C(0x9E3779B97F4A7C15))
+                  ^ (static_cast<uint64_t>(cache_id) * UINT64_C(0xC2B2AE3D27D4EB4F));
+  return static_cast<uint32_t>((hash >> 20) & (FT_WORD_CODE_CACHE_SIZE - 1));
+}
+
+inline bool ft_word_pack_key(const char *word, const int64_t word_len, uint32_t &word_key)
+{
+  bool packed = false;
+  if (word_len > 0 && word_len <= static_cast<int64_t>(sizeof(uint32_t))) {
+    word_key = 0;
+    for (int64_t i = 0; i < word_len; ++i) {
+      word_key |= static_cast<uint32_t>(static_cast<uint8_t>(word[i])) << (i * 8);
+    }
+    packed = true;
+  }
+  return packed;
+}
+} // namespace
+
 template <typename DATA_TYPE>
 int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
 {
@@ -49,6 +98,7 @@ int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
     } else {
       memset(dat_, 0, total_size);
       dat_->mem_block_size_ = total_size;
+      dat_->cache_id_ = next_dat_cache_id();
       dat_->array_size_ = array_size;
       dat_->base_offset_ = map_size;
       dat_->check_offset_ = dat_->base_offset_ + base_size;
@@ -208,6 +258,7 @@ int ObFTDATBuilder<DATA_TYPE>::expand()
   } else {
     memset(new_dat, 0, buffer_size);
     new_dat->mem_block_size_ = buffer_size;
+    new_dat->cache_id_ = dat_->cache_id_;
     new_dat->array_size_ = array_size * 2;
     new_dat->base_offset_ = dat_->base_offset_;
     new_dat->check_offset_ = dat_->check_offset_ + base_inc;
@@ -254,13 +305,42 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
   int ret = OB_SUCCESS;
   ObFTWordCode code;
   hit.set_unmatch();
-  auto *map = dat_->get_map();
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  uint32_t word_key = 0;
+  const bool cacheable = 0 != dat_->cache_id_
+                         && ft_word_pack_key(ft_char.ptr(), ft_char.length(), word_key);
+  bool code_known = false;
+  if (cacheable) {
+    ObFTWordCodeCacheEntry &entry =
+        FT_WORD_CODE_CACHE[ft_word_cache_index(dat_->cache_id_, word_key)];
+    if (entry.cache_id_ == dat_->cache_id_ && entry.word_key_ == word_key
+        && 0 != entry.code_ && entry.word_len_ == ft_char.length()) {
+      code_known = true;
+      if (entry.code_ < 0) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        code = entry.code_;
+      }
+    }
+  }
+
+  if (!code_known) {
+    ObFTSingleWord word;
+    word.set_word(ft_char.ptr(), ft_char.length());
+    ret = dat_->get_map()->find(word, code);
+    if (cacheable && (OB_SUCCESS == ret || OB_ENTRY_NOT_EXIST == ret)) {
+      ObFTWordCodeCacheEntry &entry =
+          FT_WORD_CODE_CACHE[ft_word_cache_index(dat_->cache_id_, word_key)];
+      entry.cache_id_ = dat_->cache_id_;
+      entry.word_key_ = word_key;
+      entry.code_ = OB_SUCCESS == ret ? code : -1;
+      entry.word_len_ = static_cast<uint8_t>(ft_char.length());
+    }
+  }
+
+  if (OB_FAIL(ret) && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
     hit.set_unmatch();
