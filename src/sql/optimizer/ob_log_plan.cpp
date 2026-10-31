@@ -2421,6 +2421,7 @@ int ObLogPlan::allocate_access_path(AccessPath *ap,
                   && OB_FAIL(table_scan_filters.push_back(scan->get_text_retrieval_info().pushdown_match_filter_))) {
         } else if (OB_FAIL(scan->set_table_scan_filters(table_scan_filters))) {
         } else if (OB_FAIL(append(scan->get_pushdown_filter_exprs(), ap->pushdown_filters_))) {
+        } else if (OB_FAIL(try_skip_text_retrieval_relevance(*ap, scan))) {
         } else {
         }
       } else if (scan->use_index_merge() && OB_FAIL(scan->set_index_merge_scan_filters(ap))) {
@@ -11987,6 +11988,96 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+// A match expression whose value only feeds a boolean filter does not need the
+// BM25 score: every document returned by the retrieval scan satisfies the filter.
+static int check_exprs_hold_match(const ObIArray<ObRawExpr *> &exprs,
+                                  const ObRawExpr *retrieval_filter,
+                                  bool &hold_match)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && !hold_match && i < exprs.count(); ++i) {
+    const ObRawExpr *expr = exprs.at(i);
+    if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (expr == retrieval_filter) {
+      // the pushed down retrieval filter itself
+    } else if (expr->has_flag(CNT_MATCH_EXPR) || expr->has_flag(CNT_SUB_QUERY)) {
+      hold_match = true;
+    }
+  }
+  return ret;
+}
+
+static int check_single_expr_holds_match(const ObRawExpr *expr,
+                                         const ObRawExpr *retrieval_filter,
+                                         bool &hold_match)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr) || expr == retrieval_filter) {
+  } else if (expr->has_flag(CNT_MATCH_EXPR) || expr->has_flag(CNT_SUB_QUERY)) {
+    hold_match = true;
+  }
+  return ret;
+}
+
+// Does any expression of @stmt read the value of the match expression besides
+// the boolean retrieval filter @match_pred itself?
+static int check_stmt_uses_match_score(const ObDMLStmt &stmt,
+                                       const ObRawExpr *match_pred,
+                                       bool &uses_score)
+{
+  int ret = OB_SUCCESS;
+  uses_score = false;
+  const common::ObIArray<OrderItem> &order_items = stmt.get_order_items();
+  if (OB_FAIL(check_exprs_hold_match(stmt.get_condition_exprs(), match_pred, uses_score))) {
+  } else if (OB_FAIL(check_single_expr_holds_match(stmt.get_limit_expr(), match_pred, uses_score))) {
+  } else if (OB_FAIL(check_single_expr_holds_match(stmt.get_offset_expr(), match_pred, uses_score))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !uses_score && i < order_items.count(); ++i) {
+    if (OB_FAIL(check_single_expr_holds_match(order_items.at(i).expr_, match_pred, uses_score))) {
+    }
+  }
+  if (OB_FAIL(ret) || uses_score) {
+  } else if (stmt.get_table_items().count() > 1) {
+    // a join rewriter may lift the match expression into a join condition
+    uses_score = true;
+  } else if (!stmt.is_select_stmt()) {
+    uses_score = true;
+  } else {
+    const ObSelectStmt &select_stmt = static_cast<const ObSelectStmt &>(stmt);
+    const ObIArray<SelectItem> &select_items = select_stmt.get_select_items();
+    for (int64_t i = 0; OB_SUCC(ret) && !uses_score && i < select_items.count(); ++i) {
+      if (OB_FAIL(check_single_expr_holds_match(select_items.at(i).expr_, match_pred, uses_score))) {
+      }
+    }
+    ObSEArray<ObRawExpr *, 4> others;
+    for (int64_t i = 0; OB_SUCC(ret) && !uses_score && i < select_stmt.get_aggr_items().count(); ++i) {
+      if (OB_FAIL(others.push_back(select_stmt.get_aggr_items().at(i)))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !uses_score && i < select_stmt.get_window_func_exprs().count(); ++i) {
+      if (OB_FAIL(others.push_back(select_stmt.get_window_func_exprs().at(i)))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !uses_score && i < select_stmt.get_group_exprs().count(); ++i) {
+      if (OB_FAIL(others.push_back(select_stmt.get_group_exprs().at(i)))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !uses_score && i < select_stmt.get_rollup_exprs().count(); ++i) {
+      if (OB_FAIL(others.push_back(select_stmt.get_rollup_exprs().at(i)))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !uses_score && i < select_stmt.get_having_exprs().count(); ++i) {
+      if (OB_FAIL(others.push_back(select_stmt.get_having_exprs().at(i)))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(check_exprs_hold_match(others, match_pred, uses_score))) {
+    }
+  }
+  return ret;
+}
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,
@@ -12055,6 +12146,52 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
       if (OB_FAIL(scan_filters.push_back(curr_filter))) {
       }
     }
+  }
+  return ret;
+}
+
+int ObLogPlan::try_skip_text_retrieval_relevance(const AccessPath &ap, ObLogicalOperator *scan)
+{
+  int ret = OB_SUCCESS;
+  ObLogTableScan *table_scan = static_cast<ObLogTableScan *>(scan);
+  const ObRawExpr *match_pred = nullptr;
+  const ObMatchFunRawExpr *match_against = nullptr;
+  bool match_in_filters = false;
+  bool uses_score = true;
+  if (OB_ISNULL(scan) || OB_ISNULL(get_stmt())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(match_pred = table_scan->get_text_retrieval_info().pushdown_match_filter_)) {
+  } else if (FALSE_IT(match_against = table_scan->get_text_retrieval_info().match_expr_)) {
+  } else if (OB_ISNULL(match_pred) || OB_ISNULL(match_against)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!get_stmt()->is_select_stmt()
+             || NULL != get_stmt()->get_limit_expr()
+             || NULL != get_stmt()->get_offset_expr()
+             || ap.domain_idx_info_.has_func_lookup()
+             || ap.domain_idx_info_.has_es_match()
+             || ap.is_index_merge_path()
+             || table_scan->is_vec_adaptive_scan()
+             || table_scan->is_vec_idx_scan_post_filter()) {
+    // the score is produced by another operator or re-evaluated above the DAS scan, and with a
+    // TOP-N limit the pushed down filter prunes on the retrieval order, which the unscored scan
+    // is free to reorder
+  } else if (NATURAL_LANGUAGE_MODE != match_against->get_mode_flag()) {
+  } else if (!(match_pred == match_against
+             || (T_OP_BOOL == match_pred->get_expr_type()
+                 && 1 == match_pred->get_param_count()
+                 && match_pred->get_param_expr(0) == match_against))) {
+    // the pushed down filter is not a plain truthiness test on the match expression
+  } else if (OB_FAIL(check_exprs_hold_match(table_scan->get_filter_exprs(), match_pred,
+                                            match_in_filters))) {
+  } else if (OB_FAIL(check_exprs_hold_match(table_scan->get_pushdown_filter_exprs(), match_pred,
+                                            match_in_filters))) {
+  } else if (match_in_filters) {
+  } else if (OB_FAIL(check_stmt_uses_match_score(*get_stmt(), match_pred, uses_score))) {
+  } else if (!uses_score) {
+    // The retrieval scan emits exactly the documents which match at least one query token and
+    // every such document has a strictly positive BM25 score, so a truthiness test on the match
+    // expression selects the same rows as the scored evaluation.
+    table_scan->get_text_retrieval_info().need_calc_relevance_ = false;
   }
   return ret;
 }

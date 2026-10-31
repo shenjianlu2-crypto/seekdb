@@ -1114,7 +1114,10 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
     case ObDASOpType::DAS_OP_IR_SCAN:
     case ObDASOpType::DAS_OP_SORT: {
       ObDASCacheLookupIter *lookup_iter = nullptr;
-      if (nullptr != ir_scan_ctdef && ir_scan_ctdef->need_calc_relevance()) {
+      // The retrieval order has to survive the lookups whenever the document is scored or the
+      // projected match column can be used to sort or prune the scan above.
+      if (nullptr != ir_scan_ctdef
+          && (ir_scan_ctdef->need_calc_relevance() || ir_scan_ctdef->need_proj_relevance_score())) {
         main_lookup_keep_order = true;
         // TODO: may be optimized to use forward
       }
@@ -1142,7 +1145,8 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
       ObDASCacheLookupIter *lookup_iter = nullptr;
       // below cases need keep order when look up the table
       // case: Taat or need sort by relevance
-      if (nullptr != ir_scan_ctdef && ir_scan_ctdef->need_calc_relevance()) {
+      if (nullptr != ir_scan_ctdef
+          && (ir_scan_ctdef->need_calc_relevance() || ir_scan_ctdef->need_proj_relevance_score())) {
         if (tr_merge_iter->is_taat_mode() || DAS_OP_SORT == aux_lookup_ctdef->get_doc_id_scan_ctdef()->op_type_) {
           doc_id_lookup_keep_order = true;
         }
@@ -1537,7 +1541,7 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (size > 0 && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
+  } else if (size > 0 && ir_scan_ctdef->need_calc_relevance() && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
     ObDASScanIterParam doc_cnt_agg_param;
     ObDASScanIter *doc_cnt_agg_iter = nullptr;
     init_scan_iter_param(doc_cnt_agg_param, ir_scan_ctdef->get_doc_agg_ctdef(), ir_scan_rtdef);

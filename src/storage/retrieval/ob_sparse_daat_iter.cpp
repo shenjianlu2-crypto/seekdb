@@ -414,6 +414,9 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
   ObExpr *id_proj_expr = iter_param_->id_proj_expr_;
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
   ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+  // Without the score calculation every buffered relevance is a placeholder. Reported as the
+  // smallest positive value so that the projected match expression keeps its truthiness.
+  const bool calc_relevance = iter_param_->need_calc_relevance();
 
   if (eval_ctx->is_vectorized()) {
     sql::ObBitVector &id_evaluated_flags = id_proj_expr->get_evaluated_flags(*eval_ctx);
@@ -429,21 +432,26 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
       for (int64_t i = 0; i < count; ++i) {
         guard.set_batch_idx(i);
         ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-        relevance_proj_datum.set_double(buffered_relevances_[i]);
+        relevance_proj_datum.set_double(calc_relevance ? buffered_relevances_[i] : 1.0);
         relevance_evaluated_flags.set(i);
         relevance_proj_expr->set_evaluated_projected(*eval_ctx);
       }
     }
   } else if (OB_UNLIKELY(1 != count)) {
     ret = OB_ERR_UNEXPECTED;
-  } else {
+  } else if (iter_param_->need_project_relevance()) {
     guard.set_batch_idx(0);
     ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
     set_datum_func_(id_proj_datum, buffered_domain_ids_[0]);
     id_proj_expr->set_evaluated_projected(*eval_ctx);
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-    relevance_proj_datum.set_double(buffered_relevances_[0]);
+    relevance_proj_datum.set_double(calc_relevance ? buffered_relevances_[0] : 1.0);
     relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+  } else {
+    guard.set_batch_idx(0);
+    ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
+    set_datum_func_(id_proj_datum, buffered_domain_ids_[0]);
+    id_proj_expr->set_evaluated_projected(*eval_ctx);
   }
   return ret;
 }
