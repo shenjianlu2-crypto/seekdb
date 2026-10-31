@@ -20,12 +20,15 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "common/json_type/ob_json_base.h"
+#include "common/json_type/ob_json_bin.h"
 #include "common/json_type/ob_json_tree.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "object/ob_object.h"
+#include "sql/engine/ob_physical_plan_ctx.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "share/ob_json_access_utils.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
@@ -39,6 +42,143 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+constexpr int64_t TOKENIZE_CACHE_CAPACITY = 64;
+constexpr int64_t TOKENIZE_CACHE_MAX_KEY_BYTES = 64 * 1024;
+constexpr int64_t TOKENIZE_CACHE_MAX_RESULT_BYTES = 1024 * 1024;
+constexpr int64_t TOKENIZE_CACHE_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+
+struct TokenizeCacheEntry
+{
+  uint64_t hash_;
+  ObCollationType collation_;
+  ObString fulltext_;
+  ObString parser_name_;
+  ObString properties_;
+  ObString result_;
+};
+
+struct TokenizeCache
+{
+  TokenizeCache()
+      : allocator_(ObMemAttr("TokenizeCache")),
+        plan_ctx_(nullptr),
+        session_(nullptr),
+        session_id_(0),
+        execution_id_(-1),
+        statement_time_(0),
+        count_(0),
+        bytes_(0),
+        write_disabled_(false)
+  {
+  }
+
+  void reset(const ObPhysicalPlanCtx *plan_ctx,
+             const ObSQLSessionInfo *session,
+             const uint32_t session_id,
+             const int64_t execution_id,
+             const int64_t statement_time)
+  {
+    allocator_.reset();
+    plan_ctx_ = plan_ctx;
+    session_ = session;
+    session_id_ = session_id;
+    execution_id_ = execution_id;
+    statement_time_ = statement_time;
+    count_ = 0;
+    bytes_ = 0;
+    write_disabled_ = false;
+  }
+
+  TokenizeCacheEntry *find(const uint64_t hash,
+                           const ObString &fulltext,
+                           const ObString &parser_name,
+                           const ObString &properties,
+                           const ObCollationType collation)
+  {
+    TokenizeCacheEntry *result = nullptr;
+    for (int64_t i = 0; i < count_; ++i) {
+      TokenizeCacheEntry &entry = entries_[i];
+      if (entry.hash_ == hash && entry.collation_ == collation
+          && entry.fulltext_ == fulltext
+          && entry.parser_name_ == parser_name && entry.properties_ == properties) {
+        result = &entry;
+        break;
+      }
+    }
+    return result;
+  }
+
+  void add(const uint64_t hash,
+           const ObString &fulltext,
+           const ObString &parser_name,
+           const ObString &properties,
+           const ObCollationType collation,
+           const ObString &result)
+  {
+    const int64_t key_bytes = static_cast<int64_t>(fulltext.length())
+                              + parser_name.length() + properties.length();
+    const int64_t entry_bytes = key_bytes + result.length();
+    if (write_disabled_ || count_ >= TOKENIZE_CACHE_CAPACITY
+        || key_bytes > TOKENIZE_CACHE_MAX_KEY_BYTES
+        || result.length() > TOKENIZE_CACHE_MAX_RESULT_BYTES
+        || bytes_ + entry_bytes > TOKENIZE_CACHE_MAX_TOTAL_BYTES) {
+      return;
+    }
+
+    TokenizeCacheEntry entry;
+    entry.hash_ = hash;
+    entry.collation_ = collation;
+    const ObString *sources[] = {&fulltext, &parser_name, &properties, &result};
+    ObString *targets[] = {&entry.fulltext_, &entry.parser_name_, &entry.properties_, &entry.result_};
+    for (int64_t i = 0; i < 4; ++i) {
+      if (0 == sources[i]->length()) {
+        targets[i]->reset();
+      } else {
+        char *buf = static_cast<char *>(allocator_.alloc(sources[i]->length()));
+        if (OB_ISNULL(buf)) {
+          write_disabled_ = true;
+          return;
+        }
+        MEMCPY(buf, sources[i]->ptr(), sources[i]->length());
+        *targets[i] = ObString(sources[i]->length(), buf);
+      }
+    }
+    entries_[count_++] = entry;
+    bytes_ += entry_bytes;
+  }
+
+  ObArenaAllocator allocator_;
+  const ObPhysicalPlanCtx *plan_ctx_;
+  const ObSQLSessionInfo *session_;
+  uint32_t session_id_;
+  int64_t execution_id_;
+  int64_t statement_time_;
+  int64_t count_;
+  int64_t bytes_;
+  bool write_disabled_;
+  TokenizeCacheEntry entries_[TOKENIZE_CACHE_CAPACITY];
+};
+
+uint64_t hash_tokenize_input(const ObString &fulltext,
+                             const ObString &parser_name,
+                             const ObString &properties)
+{
+  uint64_t hash = 0;
+  if (fulltext.length() > 0) {
+    hash = common::murmurhash(fulltext.ptr(), fulltext.length(), hash);
+  }
+  if (parser_name.length() > 0) {
+    hash = common::murmurhash(parser_name.ptr(), parser_name.length(), hash);
+  }
+  if (properties.length() > 0) {
+    hash = common::murmurhash(properties.ptr(), properties.length(), hash);
+  }
+  return hash;
+}
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -59,19 +199,121 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 
   ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
+  static thread_local TokenizeCache cache;
+  bool cache_hit = false;
+  bool can_cache = false;
+  uint64_t input_hash = 0;
+  ObPhysicalPlanCtx *plan_ctx = nullptr;
+  // the raw arguments are the cache key; they are read before the expensive
+  // parser/property parsing so that a hit skips that work entirely
+  ObString raw_fulltext;
+  ObString raw_parser_name;
+  ObString raw_properties;
+  bool has_null_arg = false;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (OB_FAIL(read_raw_args(expr, ctx, raw_fulltext, raw_parser_name, raw_properties,
+                                   has_null_arg))) {
+  } else {
+    plan_ctx = ctx.exec_ctx_.get_physical_plan_ctx();
+    ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
+    const int64_t execution_id = OB_ISNULL(session) ? -1 : session->get_current_execution_id();
+    const uint32_t session_id = OB_ISNULL(session) ? 0 : session->get_server_sid();
+    // TOKENIZE output only depends on the input text and the parser/dictionary
+    // state, both constant inside one statement execution.  The session keeps a
+    // monotonically increasing execution id, which is the reliable statement
+    // boundary here: a plain SELECT does not necessarily fetch cur_time.
+    int64_t statement_time = 0;
+    bool has_statement_time = OB_NOT_NULL(plan_ctx) && plan_ctx->has_cur_time();
+    if (has_statement_time) {
+      statement_time = plan_ctx->get_cur_time().get_timestamp();
+    }
+    can_cache = OB_NOT_NULL(plan_ctx) && !has_null_arg
+                && (execution_id >= 0 || has_statement_time);
+    if (can_cache) {
+      if (cache.plan_ctx_ != plan_ctx || cache.session_ != session || cache.session_id_ != session_id
+          || cache.execution_id_ != execution_id || cache.statement_time_ != statement_time) {
+        cache.reset(plan_ctx, session, session_id, execution_id, statement_time);
+      }
+      const ObCollationType collation = expr.args_[0]->obj_meta_.get_collation_type();
+      input_hash = hash_tokenize_input(raw_fulltext, raw_parser_name, raw_properties);
+      TokenizeCacheEntry *entry = cache.find(input_hash, raw_fulltext, raw_parser_name,
+                                             raw_properties, collation);
+      if (OB_NOT_NULL(entry)) {
+        cache_hit = true;
+        ret = ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, entry->result_);
+      }
+    }
   }
 
+  if (OB_SUCC(ret) && !cache_hit) {
+    if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                       ctx,
+                                                       temp_allocator,
+                                                       json_result,
+                                                       expr_datum))) {
+    } else if (can_cache) {
+      // The output datum may carry a lob header, so cache the bare JSON binary
+      // that pack_json_res() packs.  A hit then takes the very same packing
+      // step, which keeps hit and miss results byte identical.
+      bool should_pack_diff = false;
+      ObString raw_binary;
+      if (json_result->is_bin()
+          && OB_FAIL(static_cast<ObJsonBin *>(json_result)->should_pack_diff(should_pack_diff))) {
+        // do not cache; ret stays success
+      } else if (!should_pack_diff
+                 && OB_SUCCESS == share::ObJsonWrapper::get_raw_binary(json_result, raw_binary,
+                                                                      &temp_allocator)) {
+        cache.add(input_hash, raw_fulltext, raw_parser_name, raw_properties,
+                  param.meta_.get_collation_type(), raw_binary);
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObExprTokenize::read_raw_args(const ObExpr &expr,
+                                  ObEvalCtx &ctx,
+                                  ObString &fulltext,
+                                  ObString &parser_name,
+                                  ObString &properties,
+                                  bool &has_null_arg)
+{
+  int ret = OB_SUCCESS;
+  ObDatum *datum = nullptr;
+  has_null_arg = false;
+  if (OB_FAIL(expr.args_[0]->eval(ctx, datum))) {
+  } else if (OB_ISNULL(datum) || datum->is_null()) {
+    has_null_arg = true;
+    fulltext.reset();
+  } else {
+    fulltext = datum->get_string();
+  }
+
+  if (OB_SUCC(ret) && expr.arg_cnt_ >= 2) {
+    if (OB_FAIL(expr.args_[1]->eval(ctx, datum))) {
+    } else if (OB_ISNULL(datum) || datum->is_null()) {
+      has_null_arg = true;
+      parser_name.reset();
+    } else {
+      parser_name = datum->get_string();
+    }
+  }
+
+  if (OB_SUCC(ret) && expr.arg_cnt_ >= 3) {
+    if (OB_FAIL(expr.args_[2]->eval(ctx, datum))) {
+    } else if (OB_ISNULL(datum) || datum->is_null()) {
+      has_null_arg = true;
+      properties.reset();
+    } else {
+      properties = datum->get_string();
+    }
+  }
   return ret;
 }
 

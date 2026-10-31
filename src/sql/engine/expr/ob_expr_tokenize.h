@@ -81,6 +81,17 @@ private:
   };
 
 private:
+  // Read the raw TOKENIZE arguments.  They form the cache key, so they are read
+  // before parse_param() and skip all parser/property parsing on a cache hit.
+  // Caching is skipped when any argument is NULL because a NULL parser name
+  // falls back to the default parser while an empty one is an error.
+  static int read_raw_args(const ObExpr &expr,
+                           ObEvalCtx &ctx,
+                           common::ObString &fulltext,
+                           common::ObString &parser_name,
+                           common::ObString &properties,
+                           bool &has_null_arg);
+
   static int parse_param(const ObExpr &expr,
                          ObEvalCtx &ctx,
                          common::ObArenaAllocator &allocator,
