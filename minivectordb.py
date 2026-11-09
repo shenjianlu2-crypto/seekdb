@@ -607,6 +607,8 @@ class ParsedStatement:
     values: Optional[List[Dict[str, Any]]] = None
     # select
     select_cols: Optional[List[str]] = None
+    # (kind, column, vector literal, alias); kind is column or distance
+    select_items: Optional[List[Tuple[str, str, Optional[str], Optional[str]]]] = None
     where: Optional["Condition"] = None
     order_by: Optional[List[Tuple[str, str]]] = None  # (col, asc/desc) or (l2_expr, asc)
     limit: Optional[int] = None
@@ -887,12 +889,33 @@ def parse_insert(tok: Tokenizer) -> ParsedStatement:
 def parse_select(tok: Tokenizer) -> ParsedStatement:
     tok.expect("ident", "SELECT")
     select_cols = []
+    select_items = []
     if tok.match("op", "*"):
         tok.next()
         select_cols = ["*"]
     else:
         while True:
-            select_cols.append(tok.next()[1])
+            if tok.match("ident", "L2_DISTANCE"):
+                tok.next()
+                tok.expect("op", "(")
+                column = tok.next()[1]
+                tok.expect("op", ",")
+                vector = parse_value(tok.next())
+                tok.expect("op", ")")
+                alias = None
+                if tok.match("ident", "AS"):
+                    tok.next()
+                    alias = tok.next()[1]
+                select_items.append(("distance", column, vector, alias))
+                select_cols.append(alias or "L2_DISTANCE")
+            else:
+                column = tok.next()[1]
+                alias = None
+                if tok.match("ident", "AS"):
+                    tok.next()
+                    alias = tok.next()[1]
+                select_items.append(("column", column, None, alias))
+                select_cols.append(alias or column)
             if tok.match("op", ","):
                 tok.next()
             else:
@@ -911,6 +934,22 @@ def parse_select(tok: Tokenizer) -> ParsedStatement:
         tok.next()
         tok.expect("ident", "BY")
         order_by, vector_order, approximate = parse_order_by(tok)
+        # Resolve ORDER BY aliases, including an aliased L2_DISTANCE expression.
+        for order_column, _ in order_by or []:
+            for kind, column, vector, alias in select_items:
+                if alias is not None and alias.lower() == order_column.lower():
+                    if kind == "distance":
+                        vector_order = (column, vector)
+                        order_by = None
+                    else:
+                        order_by = [
+                            (
+                                column if candidate.lower() == order_column.lower() else candidate,
+                                direction,
+                            )
+                            for candidate, direction in order_by
+                        ]
+                    break
     if tok.match("ident", "LIMIT"):
         tok.next()
         limit = int(tok.next()[1])
@@ -918,6 +957,7 @@ def parse_select(tok: Tokenizer) -> ParsedStatement:
         type="select",
         table=tname,
         select_cols=select_cols,
+        select_items=select_items,
         where=where,
         order_by=order_by,
         limit=limit,
@@ -1146,9 +1186,9 @@ class Executor:
         if col_names is None:
             col_names = [c.name for c in td.columns]
         persist = self._persist()
-        count = 0
-        n_rows = len(rows_vals)
-        for vi, vals in enumerate(rows_vals):
+        prepared_rows = []
+        seen_keys = set(self.storage._pkey_set.get(stmt.table, set()))
+        for vals in rows_vals:
             row = {}
             for i, cname in enumerate(col_names):
                 col = td.column(cname)
@@ -1156,8 +1196,17 @@ class Executor:
                     raise ValueError(f"Unknown column: {cname}")
                 raw = vals[i]
                 row[cname] = self._coerce(raw, col)
+            pkey = row[td.primary_key]
+            if pkey in seen_keys:
+                raise ValueError(f"Duplicate primary key: {pkey}")
+            seen_keys.add(pkey)
+            prepared_rows.append(row)
+
+        # Validate the entire statement before mutating rows, the WAL, or indexes.
+        count = len(prepared_rows)
+        for vi, row in enumerate(prepared_rows):
             # In auto-commit mode, flush WAL only on the last row
-            flush = persist and (vi == n_rows - 1)
+            flush = persist and (vi == count - 1)
             self.storage.insert_row(stmt.table, row, persist=persist, flush=flush)
             if not persist:
                 self.transaction.add_wal({"op": "insert", "table": stmt.table, "row": dict(row)})
@@ -1166,7 +1215,6 @@ class Executor:
                 idx = self.vector_indexes.get((stmt.table, td.vector_column))
                 if idx:
                     idx.add(row[td.primary_key], row[td.vector_column])
-            count += 1
         return f"Query OK, {count} row{'s' if count != 1 else ''} affected"
 
     def exec_select(self, stmt: ParsedStatement) -> str:
@@ -1221,22 +1269,35 @@ class Executor:
             rows = rows[:stmt.limit]
         # projection
         if stmt.select_cols == ["*"]:
-            proj_cols = [c.name for c in td.columns]
+            select_items = [("column", c.name, None, None) for c in td.columns]
         else:
-            proj_cols = stmt.select_cols
-            # validate columns exist
-            for cname in proj_cols:
-                if td.column(cname) is None:
+            select_items = stmt.select_items or [
+                ("column", cname, None, None) for cname in stmt.select_cols
+            ]
+            for kind, cname, vector, alias in select_items:
+                col = td.column(cname)
+                if col is None:
                     raise ValueError(f"Unknown column '{cname}' in field list")
+                if kind == "distance" and col.type != Type.VECTOR:
+                    raise ValueError(f"L2_DISTANCE requires a VECTOR column: {cname}")
+                if kind == "distance":
+                    parse_vector_literal(vector, col.length)
         # format output
         lines = []
         # header
-        lines.append("\t".join(proj_cols))
+        headers = []
+        for kind, cname, vector, alias in select_items:
+            headers.append(alias or (cname if kind == "column" else "L2_DISTANCE"))
+        lines.append("\t".join(headers))
         for r in rows:
             vals = []
-            for cname in proj_cols:
+            for kind, cname, vector, alias in select_items:
                 col = td.column(cname)
-                vals.append(format_value(r.get(cname), col))
+                if kind == "distance":
+                    query_vec = parse_vector_literal(vector, col.length)
+                    vals.append(format_float(l2_distance(r.get(cname), query_vec)))
+                else:
+                    vals.append(format_value(r.get(cname), col))
             lines.append("\t".join(vals))
         return "\n".join(lines)
 
