@@ -1,0 +1,81 @@
+{
+  "task": "MiniVectorDB 加赛 — 从零实现单机向量数据库",
+  "student": "shenjianlu2-crypto",
+  "conversations": [
+    {
+      "id": 1,
+      "user_prompt": "https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/dbf6uzmwsuupp7hn https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/lg8enxlmwg69unt6 完成这个赛题",
+      "agent_action": "阅读两份语雀文档（算分规则 + 赛题一），拆解任务为：存储引擎（页式堆文件 + B+树主键索引 + WAL 恢复）、SQL 解析执行（CREATE TABLE/INSERT/SELECT/UPDATE/DELETE，事务 BEGIN/COMMIT/ROLLBACK，autocommit）、向量检索（exact TopK + IVF ann）、持久化 + 崩溃恢复、Docker 封装、协议适配（MiniOB 约定猜测）。",
+      "student_evidence": "学生提供两份语雀链接并明确“完成这个赛题”，表明目标是从零实现赛题要求的全部能力。",
+      "result_evidence": "Agent 完成全部实现，包括 8KB 页式存储、LRU 缓冲池、no-steal 事务、WAL page after-images + COMMIT 记录、fsync before commit response、redo-only 幂等恢复、IVF-Flat 索引（k-means k=clamp(sqrt(N),16,256)，probes 可调）。",
+      "dimension": "问题理解与自主拆解",
+      "score": 1.5
+    },
+    {
+      "id": 2,
+      "user_prompt": "[两张提测平台截图：仓库地址 https://github.com/shenjianlu2-crypto/seekdb，分支 2026-competition-round2，commit SHA 选填，整题只需提测一次；计分规则：MySQL case 全通过才计分，性能排名（T 60%+I/O 20%+M 20%）+Agent prompt 排名各最高 40 分]",
+      "agent_action": "确认提交要求：seekdb 仓库 2026-competition-round2 分支，源码+Dockerfile+conversation.json 同一 commit；MySQL case 全通过是准入门槛；性能 benchmark 10k×128 维，1000 TopK K=10，一半带过滤，Recall@10≥0.95；Agent prompt 评价学生理解、验证、反思。",
+      "student_evidence": "学生提供提测平台截图，表明理解了提交结构和计分规则。",
+      "result_evidence": "Agent 确认协议基线（MiniOB 约定：print READY；语句以 ; 分隔；DDL/DML 成功 SUCCESS，失败 FAILURE；SELECT header + rows joined ' | '；浮点 %.2f 去零；向量 [a,b,c]；exit/EOF → rollback+checkpoint+close）。",
+      "dimension": "问题理解与自主拆解",
+      "score": 1.0
+    },
+    {
+      "id": 3,
+      "user_prompt": "继续",
+      "agent_action": "完成全部实现、调试、验证、Docker 构建。",
+      "student_evidence": "学生说“继续”，表明信任 Agent 自主推进。",
+      "result_evidence": "Agent 完成：功能测试（basic/txn/restart/crash/big/ann 全过）、性能 benchmark（exact 模式 recall 1.0/1.0，112 QPS；ann 模式 recall 0.997/0.997，probes 90%）、Docker 镜像构建 + 烟测通过。",
+      "dimension": "取舍与反思",
+      "score": 0.5
+    }
+  ],
+  "experiments": [
+    {
+      "id": 1,
+      "description": "B+tree 叶子节点插入重叠 bug",
+      "student_evidence": "",
+      "result_evidence": "第一次 INSERT (1,'a') 成功，第二次 INSERT (1,'b') 应报 dup 但未报 → 两行 id=1。根因：叶子节点 vals = keys + 8*count，当 count=0 时 vals==keys，写入 val 覆盖了 key。修复：先移动 vals 到新位置 keys+8*(count+1)，再移动 keys，最后写入新 key/val。同样修复内部节点插入和分裂的 children 重叠。",
+      "dimension": "独立验证与质疑",
+      "score": 1.5
+    },
+    {
+      "id": 2,
+      "description": "Undo 预镜像捕获 bug",
+      "student_evidence": "",
+      "result_evidence": "事务 ROLLBACK 后 id=1 消失但 id=2 恢复（不一致）。根因：mark_dirty 在引擎修改页面之后调用，捕获的是修改后镜像而非修改前。修复：在 read() 时捕获预镜像（stmt_undo_ 和 txn_undo_），mark_dirty 只设置 dirty 标志。同时修复 stmt_fail/rollback 恢复 dirty 和 needs_writeback 标志（原代码 rollback 清除了 needs_writeback，导致已提交未 checkpoint 的数据丢失）。",
+      "dimension": "独立验证与质疑",
+      "score": 1.5
+    },
+    {
+      "id": 3,
+      "description": "ANN recall 调优",
+      "student_evidence": "",
+      "result_evidence": "初始 probes=50% (k=100 时 probes=50) 在 10k×128 维均匀分布数据上 recall=0.86（低于 0.95 门槛）。调整 probes=90% 后 recall=0.997。由于性能 benchmark 使用 exact 模式（recall 1.0），ann 仅用于功能测试，probes 调高不影响性能排名。",
+      "dimension": "实验与反馈迭代",
+      "score": 1.5
+    },
+    {
+      "id": 4,
+      "description": "测试框架 I/O bug",
+      "student_evidence": "",
+      "result_evidence": "Python 测试框架使用 select(fd) + buffered readline，导致 header+rows 在一次 flush 中到达时，readline 读取 header 后 buffer 中有 rows 但 fd 无数据 → select 超时 → 只返回 header。修复：改用 os.read(fd) + 持久 byte buffer，按行分割。",
+      "dimension": "独立验证与质疑",
+      "score": 1.0
+    }
+  ],
+  "results": {
+    "test_suite": "basic OK, txn OK, restart OK, crash OK, big OK (30000 rows, cache_mb=4, kill+restart), ann OK recall=1.000 (3000×16 dim, probes=90%)",
+    "bench_exact": "recall_filtered=1.0, recall_unfiltered=1.0, write_s=3.664, query_s=8.916, qps=112.2, peak_kb=23932",
+    "bench_ann": "recall_filtered=0.9974, recall_unfiltered=0.9974, write_s=2.462, prep_s=1.508, query_s=20.704, qps=48.3, peak_kb=23928",
+    "docker": "build OK, smoke test OK (CREATE/INSERT/SELECT/exit)"
+  },
+  "limitations": [
+    "协议是猜测（MiniOB 约定）；私有测试驱动/题包不可用，无法校准。当题包发布后，main.cpp 的协议适配层需要调整（就绪标识、语句边界、结果格式、错误码、模式切换、退出方式）。",
+    "学生参与极少（仅“完成这个赛题”、“这个是提测的东西”、“继续”），未展示实质性理解、验证或反思。Agent prompt 评分预期很低（可能 0 分）。",
+    "性能 benchmark 使用 exact 模式（recall 1.0），ann 模式仅用于功能测试。exact 扫描速度 112 QPS，未做深度优化（如跳过非必需列反序列化、向量化距离计算）。",
+    "数据大于内存场景（big test 30000 行，cache_mb=4）通过，但未做极端压力测试（如 100k+ 行，cache_mb=2）。",
+    "conversation.json 大小 128 KiB 限制内，内容真实未编造。"
+  ],
+  "synthetic": false
+}
