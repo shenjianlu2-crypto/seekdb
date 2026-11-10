@@ -1087,6 +1087,7 @@ class Executor:
         self.storage = storage
         self.transaction = Transaction()
         self.vector_indexes: Dict[Tuple[str, str], VectorIndex] = {}
+        self.last_select_result: Optional[Dict[str, Any]] = None
         self._build_indexes_from_data()
 
     def _build_indexes_from_data(self):
@@ -1284,6 +1285,7 @@ class Executor:
                     parse_vector_literal(vector, col.length)
         # format output
         lines = []
+        structured_rows = []
         # header
         headers = []
         for kind, cname, vector, alias in select_items:
@@ -1291,14 +1293,20 @@ class Executor:
         lines.append("\t".join(headers))
         for r in rows:
             vals = []
+            structured_values = []
             for kind, cname, vector, alias in select_items:
                 col = td.column(cname)
                 if kind == "distance":
                     query_vec = parse_vector_literal(vector, col.length)
-                    vals.append(format_float(l2_distance(r.get(cname), query_vec)))
+                    value = l2_distance(r.get(cname), query_vec)
+                    vals.append(format_float(value))
                 else:
-                    vals.append(format_value(r.get(cname), col))
+                    value = r.get(cname)
+                    vals.append(format_value(value, col))
+                structured_values.append(value)
             lines.append("\t".join(vals))
+            structured_rows.append(structured_values)
+        self.last_select_result = {"columns": headers, "rows": structured_rows}
         return "\n".join(lines)
 
     def exec_update(self, stmt: ParsedStatement) -> str:
@@ -1465,47 +1473,132 @@ def split_statements(text: str) -> List[str]:
     return stmts
 
 
+class ProtocolRequestError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _protocol_json_loads(text: str) -> Any:
+    def reject_constant(value: str):
+        raise ValueError("non-finite JSON number: " + value)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key: " + key)
+            result[key] = value
+        return result
+
+    return json.loads(
+        text,
+        parse_constant=reject_constant,
+        object_pairs_hook=unique_object,
+    )
+
+
+def _emit_protocol_json(message: Dict[str, Any]):
+    line = json.dumps(
+        message,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def _protocol_error_code(error: Exception) -> str:
+    message = str(error).lower()
+    if "duplicate primary key" in message or "duplicate key" in message:
+        return "duplicate_key"
+    if isinstance(error, ProtocolRequestError):
+        return error.code
+    if isinstance(error, (ParseError, ValueError, KeyError)):
+        return "sql_error"
+    return "internal_error"
+
+
+def _execute_protocol_request(executor: Executor, request: Dict[str, Any]):
+    ident = request.get("id")
+    op = request.get("op")
+    if op == "shutdown":
+        if executor.transaction.active:
+            executor.transaction.rollback(executor.storage)
+            executor._build_indexes_from_data()
+        executor.storage.shutdown()
+        return {"id": ident, "ok": True}, True
+    if op != "execute":
+        raise ProtocolRequestError("unsupported_operation", "Unsupported operation")
+
+    sql = request.get("sql")
+    if not isinstance(sql, str):
+        raise ProtocolRequestError("invalid_request", "sql must be a string")
+    search_mode = request.get("search_mode", "exact")
+    if search_mode not in ("exact", "ann"):
+        raise ProtocolRequestError("invalid_search_mode", "search_mode must be exact or ann")
+
+    statement = parse_statement(sql)
+    if statement.type == "select" and statement.vector_order is not None:
+        statement.approximate = search_mode == "ann"
+    executor.last_select_result = None
+    result = executor.execute(statement)
+
+    response = {"id": ident, "ok": True}
+    if statement.type == "select":
+        response.update(executor.last_select_result or {"columns": [], "rows": []})
+    elif statement.type in ("insert", "update", "delete"):
+        match = re.search(r"\b(\d+) rows? affected\b", result)
+        if match is None:
+            raise RuntimeError("DML statement did not report affected rows")
+        response["affected_rows"] = int(match.group(1))
+    return response, False
+
+
 def run_server():
     storage = StorageEngine(get_data_dir())
     executor = Executor(storage)
+    storage_closed = False
+    _emit_protocol_json({"type": "ready"})
 
-    # Signal readiness
-    sys.stdout.write("ready\n")
-    sys.stdout.flush()
-
-    buffer = ""
     try:
         for line in sys.stdin:
-            buffer += line
-            # Strip comments and split into statements
-            cleaned = _strip_comments(buffer)
-            # Find the last semicolon position to determine complete statements
-            last_semi = cleaned.rfind(";")
-            if last_semi < 0:
-                continue
-            # Process all complete statements
-            complete = cleaned[:last_semi + 1]
-            buffer = cleaned[last_semi + 1:]
-            # Keep original buffer remainder for multi-line statements
-            # Actually, we need to be careful: _strip_comments changes positions
-            # Let's just use split_statements on the complete part
-            for stmt_text in split_statements(complete):
-                if not stmt_text.strip():
-                    continue
-                try:
-                    stmt = parse_statement(stmt_text)
-                    result = executor.execute(stmt)
-                    if result:
-                        sys.stdout.write(result + "\n")
-                except (ParseError, ValueError) as e:
-                    sys.stdout.write(f"ERROR 1064 (42000): {e}\n")
-                except Exception as e:
-                    sys.stdout.write(f"ERROR 1000 (HY000): {e}\n")
-                sys.stdout.flush()
-    except KeyboardInterrupt:
-        pass
+            ident = None
+            try:
+                request = _protocol_json_loads(line)
+                if not isinstance(request, dict):
+                    raise ProtocolRequestError("invalid_request", "request must be a JSON object")
+                if "id" not in request:
+                    raise ProtocolRequestError("invalid_request", "request is missing id")
+                ident = request["id"]
+                response, should_exit = _execute_protocol_request(executor, request)
+                if should_exit:
+                    storage_closed = True
+                    _emit_protocol_json(response)
+                    return
+                _emit_protocol_json(response)
+            except (ParseError, ValueError, KeyError, ProtocolRequestError) as error:
+                _emit_protocol_json({
+                    "id": ident,
+                    "ok": False,
+                    "error": {"code": _protocol_error_code(error), "message": str(error)},
+                })
+            except Exception as error:
+                print("MiniVectorDB request failed:", repr(error), file=sys.stderr, flush=True)
+                _emit_protocol_json({
+                    "id": ident,
+                    "ok": False,
+                    "error": {"code": _protocol_error_code(error), "message": str(error)},
+                })
     finally:
-        storage.shutdown()
+        if not storage_closed:
+            try:
+                if executor.transaction.active:
+                    executor.transaction.rollback(storage)
+                    executor._build_indexes_from_data()
+            finally:
+                storage.shutdown()
 
 
 def _find_statement_end(text: str) -> int:
