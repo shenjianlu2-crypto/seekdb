@@ -554,20 +554,21 @@ class VectorIndex:
             # compute L2 distances using numpy
             diff = self._np_vectors - q
             dists = np.sqrt(np.sum(diff * diff, axis=1))
-            # filter by candidate_ids if needed
-            if candidate_ids is not None:
-                mask = np.array([pk in candidate_ids for pk in self.pkeys], dtype=bool)
-                dists = np.where(mask, dists, np.inf)
-            # get top-k indices
-            if k >= n:
-                idx = np.argsort(dists, kind='stable')
-            else:
-                idx = np.argpartition(dists, k - 1)[:k]
-                idx = idx[np.argsort(dists[idx], kind='stable')]
-            results = [(self.pkeys[i], float(dists[i])) for i in idx]
-            # secondary sort by pkey for ties
-            results.sort(key=lambda x: (x[1], _sort_key(x[0])))
-            return results[:k]
+            eligible = (
+                [i for i, pk in enumerate(self.pkeys) if pk in candidate_ids]
+                if candidate_ids is not None else range(n)
+            )
+            if k <= 0 or not eligible:
+                return []
+            if k < len(eligible):
+                # Include every distance tie at the cutoff before ordering by
+                # primary key; argpartition alone chooses arbitrary tied rows.
+                cutoff = np.partition(dists[eligible], k - 1)[k - 1]
+                eligible = [i for i in eligible if dists[i] <= cutoff]
+            eligible = sorted(
+                eligible, key=lambda i: (float(dists[i]), _sort_key(self.pkeys[i]))
+            )
+            return [(self.pkeys[i], float(dists[i])) for i in eligible[:k]]
         else:
             # pure python fallback
             results = []
