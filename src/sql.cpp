@@ -143,20 +143,23 @@ struct Parser {
     return take().text;
   }
 
-  Value literal() {
-    Token t = take();
-    if (t.type == Token::NUMBER) {
-      if (t.text.find('.') == std::string::npos && t.text.find('e') == std::string::npos &&
-          t.text.find('E') == std::string::npos) {
-        errno = 0;
-        long long x = strtoll(t.text.c_str(), nullptr, 10);
-        if (errno == ERANGE) throw MVError(ER_BAD_VALUE, "integer overflow");
-        return Value::bigint((int64_t)x);
-      }
-      double d = strtod(t.text.c_str(), nullptr);
-      if (!std::isfinite(d)) throw MVError(ER_BAD_VALUE, "number not finite");
-      return Value::bigint((int64_t)llround(d));
+  Value parse_number(const std::string& text) {
+    if (text.find('.') == std::string::npos && text.find('e') == std::string::npos &&
+        text.find('E') == std::string::npos) {
+      errno = 0;
+      long long x = strtoll(text.c_str(), nullptr, 10);
+      if (errno == ERANGE) throw MVError(ER_BAD_VALUE, "integer overflow");
+      return Value::bigint((int64_t)x);
     }
+    double d = strtod(text.c_str(), nullptr);
+    if (!std::isfinite(d)) throw MVError(ER_BAD_VALUE, "number not finite");
+    return Value::bigint((int64_t)llround(d));
+  }
+
+  // The sign is folded into the text so that the BIGINT minimum parses too.
+  Value literal(bool neg = false) {
+    Token t = take();
+    if (t.type == Token::NUMBER) return parse_number((neg ? "-" : "") + t.text);
     if (t.type == Token::STRING) return Value::varchar(t.text);
     throw MVError(ER_SYNTAX, "expected literal");
   }
@@ -183,20 +186,9 @@ struct Parser {
     if (is_sym("-") || is_sym("+")) {
       std::string sign = take().text;
       if (peek().type != Token::NUMBER) throw MVError(ER_SYNTAX, "sign expects a number");
-      std::string text = (sign == "-" ? "-" : "") + take().text;
       auto e = std::make_shared<Expr>();
       e->kind = Expr::LIT;
-      if (text.find('.') == std::string::npos && text.find('e') == std::string::npos &&
-          text.find('E') == std::string::npos) {
-        errno = 0;
-        long long x = strtoll(text.c_str(), nullptr, 10);
-        if (errno == ERANGE) throw MVError(ER_BAD_VALUE, "integer overflow");
-        e->lit = Value::bigint((int64_t)x);
-      } else {
-        double d = strtod(text.c_str(), nullptr);
-        if (!std::isfinite(d)) throw MVError(ER_BAD_VALUE, "number not finite");
-        e->lit = Value::bigint((int64_t)llround(d));
-      }
+      e->lit = parse_number((sign == "-" ? "-" : "") + take().text);
       return e;
     }
     Token t = peek();
@@ -367,9 +359,7 @@ struct Parser {
           row.push_back(literal());
         } else if (t.type == Token::SYM && t.text == "-") {
           take();
-          Value v = literal();
-          if (v.type == ColType::BIGINT) v.i = -v.i;
-          row.push_back(v);
+          row.push_back(literal(true));
         } else {
           throw MVError(ER_SYNTAX, "expected value");
         }
@@ -441,7 +431,7 @@ struct Parser {
           v.v = parse_vector_literal(s);
         } else v = Value::varchar(s);
       } else if (t.type == Token::NUMBER) v = literal();
-      else if (t.type == Token::SYM && t.text == "-") { take(); v = literal(); v.i = -v.i; }
+      else if (t.type == Token::SYM && t.text == "-") { take(); v = literal(true); }
       else throw MVError(ER_SYNTAX, "expected value in SET");
       st.assigns.push_back({col, v});
       if (take_sym(",")) continue;

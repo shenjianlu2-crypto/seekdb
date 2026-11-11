@@ -892,7 +892,7 @@ bool Engine::index_topk(Table& t, const std::vector<float>& q, int64_t k,
       if (filter && !filter(r)) continue;
       double d = l2_distance(r.vals[t.vec_col].v, q);
       if ((int64_t)heap.size() < k) heap.push({d, r});
-      else {
+      else if (!heap.empty()) {
         const auto& top = heap.top();
         if (d < top.first || (d == top.first && r.pk < top.second.pk)) {
           heap.pop();
@@ -1098,7 +1098,7 @@ Result Engine::do_select(Stmt st) {
           if (!filter(r)) return true;
           double d = l2_distance(r.vals[t.vec_col].v, q);
           if ((int64_t)heap.size() < st.limit) heap.push({d, r});
-          else {
+          else if (!heap.empty()) {
             const auto& top0 = heap.top();
             if (d < top0.first || (d == top0.first && r.pk < top0.second.pk)) {
               heap.pop();
@@ -1144,7 +1144,7 @@ Result Engine::do_select(Stmt st) {
       if (!filter(r)) return true;
       Entry e = make_entry(r);
       if ((int64_t)heap.size() < st.limit) heap.push(std::move(e));
-      else if (better(e, heap.top())) { heap.pop(); heap.push(std::move(e)); }
+      else if (!heap.empty() && better(e, heap.top())) { heap.pop(); heap.push(std::move(e)); }
       return true;
     });
     std::vector<Entry> all;
@@ -1256,12 +1256,14 @@ Result Engine::execute(const Stmt& st) {
       txn_saved_valid_ = true;
       return Result{};
     case Stmt::COMMIT_STMT:
-      if (!store_.in_txn()) throw MVError(ER_TXN, "no active transaction");
+      // Outside an explicit transaction this is a no-op that succeeds, matching
+      // the MySQL behaviour the driver's own scripts assume.
+      if (!store_.in_txn()) return Result{};
       store_.commit();
       txn_saved_valid_ = false;
       return Result{};
     case Stmt::ROLLBACK_STMT:
-      if (!store_.in_txn()) throw MVError(ER_TXN, "no active transaction");
+      if (!store_.in_txn()) return Result{};
       store_.rollback();
       if (txn_saved_valid_) tables_ = txn_saved_;
       txn_saved_valid_ = false;
