@@ -1,6 +1,9 @@
 #include "sql.h"
 #include <cctype>
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 
 namespace mvdb {
 
@@ -130,6 +133,27 @@ struct Parser {
     }
   }
 
+  int positive_int(const Token& t, const char* what) {
+    if (t.type != Token::NUMBER) throw MVError(ER_SYNTAX, what);
+    errno = 0;
+    char* end = nullptr;
+    long value = strtol(t.text.c_str(), &end, 10);
+    if (errno == ERANGE || end != t.text.c_str() + t.text.size() ||
+        value <= 0 || value > INT_MAX)
+      throw MVError(ER_SYNTAX, what);
+    return (int)value;
+  }
+
+  int64_t nonnegative_limit(const Token& t) {
+    if (t.type != Token::NUMBER) throw MVError(ER_SYNTAX, "limit must be integer");
+    errno = 0;
+    char* end = nullptr;
+    long long value = strtoll(t.text.c_str(), &end, 10);
+    if (errno == ERANGE || end != t.text.c_str() + t.text.size() || value < 0)
+      throw MVError(ER_SYNTAX, "limit must be a non-negative integer");
+    return (int64_t)value;
+  }
+
   const Token& peek() { static Token end; return p < toks.size() ? toks[p] : end; }
   Token take() { return p < toks.size() ? toks[p++] : Token(); }
   bool is_kw(const char* kw) { return peek().type == Token::IDENT && upper(peek().text) == kw; }
@@ -147,13 +171,22 @@ struct Parser {
     if (text.find('.') == std::string::npos && text.find('e') == std::string::npos &&
         text.find('E') == std::string::npos) {
       errno = 0;
-      long long x = strtoll(text.c_str(), nullptr, 10);
-      if (errno == ERANGE) throw MVError(ER_BAD_VALUE, "integer overflow");
+      char* end = nullptr;
+      long long x = strtoll(text.c_str(), &end, 10);
+      if (errno == ERANGE || end != text.c_str() + text.size())
+        throw MVError(ER_BAD_VALUE, "invalid or out-of-range integer");
       return Value::bigint((int64_t)x);
     }
-    double d = strtod(text.c_str(), nullptr);
-    if (!std::isfinite(d)) throw MVError(ER_BAD_VALUE, "number not finite");
-    return Value::bigint((int64_t)llround(d));
+    errno = 0;
+    char* end = nullptr;
+    long double d = strtold(text.c_str(), &end);
+    if (errno == ERANGE || end != text.c_str() + text.size() || !std::isfinite(d))
+      throw MVError(ER_BAD_VALUE, "invalid or out-of-range number");
+    long double rounded = std::round(d);
+    const long double limit = std::ldexp(1.0L, 63);
+    if (rounded < -limit || rounded >= limit)
+      throw MVError(ER_BAD_VALUE, "integer overflow");
+    return Value::bigint((int64_t)rounded);
   }
 
   // The sign is folded into the text so that the BIGINT minimum parses too.
@@ -278,16 +311,14 @@ struct Parser {
         expect_sym("(");
         Token n = take();
         if (n.type != Token::NUMBER) throw MVError(ER_SYNTAX, "varchar length");
-        c.len = atoi(n.text.c_str());
-        if (c.len <= 0) throw MVError(ER_SYNTAX, "varchar length must be positive");
+        c.len = positive_int(n, "varchar length must be a positive integer");
         expect_sym(")");
       } else if (take_kw("VECTOR")) {
         c.type = ColType::VECTOR;
         expect_sym("(");
         Token n = take();
         if (n.type != Token::NUMBER) throw MVError(ER_SYNTAX, "vector dimension");
-        c.len = atoi(n.text.c_str());
-        if (c.len <= 0) throw MVError(ER_SYNTAX, "vector dimension must be positive");
+        c.len = positive_int(n, "vector dimension must be a positive integer");
         expect_sym(")");
       } else {
         throw MVError(ER_UNSUPPORTED, "column type not supported");
@@ -406,9 +437,7 @@ struct Parser {
     }
     if (take_kw("LIMIT")) {
       Token t = take();
-      if (t.type != Token::NUMBER) throw MVError(ER_SYNTAX, "limit must be integer");
-      st.limit = atoll(t.text.c_str());
-      if (st.limit < 0) throw MVError(ER_SYNTAX, "limit must be non-negative");
+      st.limit = nonnegative_limit(t);
     }
     return st;
   }

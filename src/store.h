@@ -31,6 +31,7 @@ class Store {
   uint8_t* read(uint32_t pid);
   void unpin(uint32_t pid);
   uint32_t alloc();
+  void free_page(uint32_t pid);
   void mark_dirty(uint32_t pid);
 
   void begin_txn();

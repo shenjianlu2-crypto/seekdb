@@ -16,21 +16,49 @@ void write_line(const std::string& s) {
   fflush(stdout);
 }
 
-std::string cell_json(const Cell& c) {
+void append_json_double(std::string& out, double d) {
+  if (!std::isfinite(d) || d == 0.0) {
+    out += "0.0";
+    return;
+  }
+  char buf[64];
+  auto result = std::to_chars(buf, buf + sizeof buf, d, std::chars_format::general);
+  if (result.ec != std::errc()) {
+    out += "0.0";
+    return;
+  }
+  const size_t len = (size_t)(result.ptr - buf);
+  out.append(buf, len);
+  if (std::memchr(buf, '.', len) == nullptr && std::memchr(buf, 'e', len) == nullptr &&
+      std::memchr(buf, 'E', len) == nullptr)
+    out += ".0";
+}
+
+void append_cell_json(std::string& out, const Cell& c) {
   switch (c.kind) {
-    case Cell::INT: return std::to_string(c.i);
-    case Cell::FLOAT: return fmt_json_double(c.d);
-    case Cell::STR: return "\"" + json_escape(c.s) + "\"";
-    case Cell::ARR: {
-      std::string s = "[";
-      for (size_t i = 0; i < c.arr.size(); i++) {
-        if (i) s += ",";
-        s += fmt_json_double(c.arr[i]);
-      }
-      s += "]";
-      return s;
+    case Cell::INT: {
+      char buf[32];
+      auto result = std::to_chars(buf, buf + sizeof buf, c.i);
+      if (result.ec == std::errc()) out.append(buf, (size_t)(result.ptr - buf));
+      else out += std::to_string(c.i);
+      return;
     }
-    default: return "null";
+    case Cell::FLOAT: append_json_double(out, c.d); return;
+    case Cell::STR:
+      out.push_back('"');
+      out += json_escape(c.s);
+      out.push_back('"');
+      return;
+    case Cell::ARR: {
+      out.push_back('[');
+      for (size_t i = 0; i < c.arr.size(); i++) {
+        if (i) out.push_back(',');
+        append_json_double(out, c.arr[i]);
+      }
+      out.push_back(']');
+      return;
+    }
+    default: out += "null"; return;
   }
 }
 
@@ -38,7 +66,10 @@ std::string ok_prefix(const std::string& id) { return "{\"id\":" + id + ",\"ok\"
 
 std::string success_json(const std::string& id, const Result& r) {
   if (r.shape == Result::QUERY) {
-    std::string s = ok_prefix(id) + ",\"columns\":[";
+    std::string s;
+    s.reserve(48 + id.size() + r.col_names.size() * 24 + r.rows.size() * 64);
+    s += ok_prefix(id);
+    s += ",\"columns\":[";
     for (size_t i = 0; i < r.col_names.size(); i++) {
       if (i) s += ",";
       s += "\"" + json_escape(r.col_names[i]) + "\"";
@@ -49,7 +80,7 @@ std::string success_json(const std::string& id, const Result& r) {
       s += "[";
       for (size_t j = 0; j < r.rows[i].size(); j++) {
         if (j) s += ",";
-        s += cell_json(r.rows[i][j]);
+        append_cell_json(s, r.rows[i][j]);
       }
       s += "]";
     }

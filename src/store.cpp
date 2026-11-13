@@ -173,12 +173,41 @@ void Store::writeback(Frame& f) {
 }
 
 uint32_t Store::alloc() {
-  uint32_t pid = next_page_++;
   uint8_t* meta = read(META_PAGE);
+  uint32_t free_head = 0;
+  memcpy(&free_head, meta + 12, 4);
+  if (free_head) {
+    uint8_t* p = read(free_head);
+    uint32_t next = 0;
+    memcpy(&next, p + 4, 4);
+    memset(p, 0, PAGE_SIZE);
+    mark_dirty(free_head);
+    unpin(free_head);
+    memcpy(meta + 12, &next, 4);
+    mark_dirty(META_PAGE);
+    unpin(META_PAGE);
+    return free_head;
+  }
+  uint32_t pid = next_page_++;
   memcpy(meta + 4, &next_page_, 4);
   mark_dirty(META_PAGE);
   unpin(META_PAGE);
   return pid;
+}
+
+void Store::free_page(uint32_t pid) {
+  if (pid == 0 || pid >= next_page_) throw MVError(ER_INTERNAL, "invalid page free");
+  uint8_t* meta = read(META_PAGE);
+  uint32_t free_head = 0;
+  memcpy(&free_head, meta + 12, 4);
+  uint8_t* p = read(pid);
+  memset(p, 0, PAGE_SIZE);
+  memcpy(p + 4, &free_head, 4);
+  mark_dirty(pid);
+  unpin(pid);
+  memcpy(meta + 12, &pid, 4);
+  mark_dirty(META_PAGE);
+  unpin(META_PAGE);
 }
 
 void Store::set_next_page(uint32_t n) {

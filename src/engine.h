@@ -4,6 +4,7 @@
 #include "store.h"
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 
 namespace mvdb {
@@ -55,6 +56,16 @@ struct IVF {
   int probes = 0;
 };
 
+struct VectorScanSnapshot {
+  std::vector<Row> rows;
+  std::vector<float> vector_data;
+  std::vector<double> vector_norm_squared;
+  std::unordered_map<int64_t, size_t> pk_to_index;
+  std::vector<std::unordered_map<std::string, std::vector<size_t>>> varchar_eq_index;
+  std::vector<bool> varchar_eq_index_valid;
+  size_t bytes = 0;
+};
+
 class Engine {
  public:
   Engine(const std::string& dir, size_t cache_bytes, const std::string& mode);
@@ -76,10 +87,14 @@ class Engine {
   RowRef heap_insert(const Table& t, const std::vector<uint8_t>& rec);
   RowRef heap_insert_into(const Table& t, uint32_t pid, const std::vector<uint8_t>& rec);
   bool heap_fits(const Table& t, uint32_t pid, size_t n);
+  std::vector<uint8_t> read_heap_record(uint32_t first_page, uint32_t stored_len);
+  void free_heap_record(uint32_t first_page, uint32_t stored_len);
   Row read_row(const Table& t, RowRef ref);
   RowRef update_row(const Table& t, RowRef ref, const std::vector<uint8_t>& rec);
   void delete_row(const Table& t, RowRef ref);
   void scan_table(const Table& t, const std::function<bool(const Row&, RowRef)>& fn);
+  const VectorScanSnapshot* vector_scan_snapshot(Table& t);
+  void invalidate_vector_scan_snapshot(uint16_t table_id);
 
   bool btree_lookup(const Table& t, int64_t pk, RowRef& out);
   void btree_insert(Table& t, int64_t pk, RowRef ref);
@@ -108,6 +123,9 @@ class Engine {
   std::string dir_;
   std::vector<Table> tables_;
   std::unordered_map<uint16_t, IVF> indexes_;
+  std::unordered_map<uint16_t, VectorScanSnapshot> vector_scan_snapshots_;
+  std::unordered_set<uint16_t> oversized_vector_scan_snapshots_;
+  size_t vector_scan_snapshot_bytes_ = 0;
   std::string mode_;
   // The catalog lives in memory too, so page undo alone cannot restore
   // pk_root/heap_hint after a split; snapshot it around each atomic unit.
